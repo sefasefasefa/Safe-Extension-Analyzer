@@ -9,6 +9,35 @@
 const INSTAGRAM_GRAPHQL_DOC_ID = '26785645987802781';
 const INSTAGRAM_APP_ID = '936619743392459';
 let downloadedResponseUser = null;
+const IG_CONTENT_REQUEST_MIN_GAP_MS = 1500;
+let contentRequestQueue = Promise.resolve();
+let lastContentRequestStartedAt = 0;
+let contentRateLimitBlockedUntil = 0;
+
+function withContentRequestSlot(task) {
+  const run = contentRequestQueue.then(async () => {
+    if (contentRateLimitBlockedUntil > Date.now()) {
+      const waitMinutes = Math.ceil((contentRateLimitBlockedUntil - Date.now()) / 60000);
+      throw new Error(`Instagram rate-limit cooldown aktif — ${waitMinutes} dk daha bekleniyor (429)`);
+    }
+    const waitMs = Math.max(
+      0,
+      IG_CONTENT_REQUEST_MIN_GAP_MS - (Date.now() - lastContentRequestStartedAt),
+    );
+    if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+    lastContentRequestStartedAt = Date.now();
+    try {
+      return await task();
+    } catch (error) {
+      if (/(?:\b429\b|rate[\s_-]*limit|feedback_required|please wait|try again later|spam)/i.test(String(error?.message ?? error))) {
+        contentRateLimitBlockedUntil = Math.max(contentRateLimitBlockedUntil, Date.now() + 30 * 60000);
+      }
+      throw error;
+    }
+  });
+  contentRequestQueue = run.catch(() => {});
+  return run;
+}
 
 function isThrottleOrSessionError(error) {
   const message = String(error?.message ?? error ?? '');
@@ -210,31 +239,38 @@ function getPageTokens() {
 }
 
 async function requestJson(endpoint, params, method = 'GET', body) {
-  let url = endpoint.startsWith('http') ? endpoint : `https://www.instagram.com${endpoint}`;
-  if (params && Object.keys(params).length) url += `?${new URLSearchParams(params).toString()}`;
-  const headers = {
-    'X-CSRFToken': csrfToken(),
-    'X-IG-App-ID': INSTAGRAM_APP_ID,
-    'X-Requested-With': 'XMLHttpRequest',
-    Accept: '*/*',
-    Referer: 'https://www.instagram.com/',
-  };
-  if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded';
-  const response = await fetch(url, {
-    method,
-    credentials: 'include',
-    headers,
-    body: body ? new URLSearchParams(body).toString() : undefined,
+  return withContentRequestSlot(async () => {
+    let url = endpoint.startsWith('http') ? endpoint : `https://www.instagram.com${endpoint}`;
+    if (params && Object.keys(params).length) url += `?${new URLSearchParams(params).toString()}`;
+    const headers = {
+      'X-CSRFToken': csrfToken(),
+      'X-IG-App-ID': INSTAGRAM_APP_ID,
+      'X-Requested-With': 'XMLHttpRequest',
+      Accept: '*/*',
+      Referer: 'https://www.instagram.com/',
+    };
+    if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    const response = await fetch(url, {
+      method,
+      credentials: 'include',
+      headers,
+      body: body ? new URLSearchParams(body).toString() : undefined,
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+    const json = JSON.parse(text.replace(/^for\s*\(;;\);\s*/, ''));
+    if (json?.status === 'fail' || json?.require_login || json?.message === 'login_required') {
+      throw new Error(`Instagram API reddetti: ${json?.message ?? 'login_required'}`);
+    }
+    return json;
   });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
-  return JSON.parse(text.replace(/^for\s*\(;;\);\s*/, ''));
 }
 
 async function requestProfileGraphQL() {
-  const { fbDtsg, lsd } = getPageTokens();
-  if (!fbDtsg || !lsd) return null;
-  const jazoest = `2${Array.from(fbDtsg).reduce((sum, character) => sum + character.charCodeAt(0), 0)}`;
+  return withContentRequestSlot(async () => {
+    const { fbDtsg, lsd } = getPageTokens();
+    if (!fbDtsg || !lsd) return null;
+    const jazoest = `2${Array.from(fbDtsg).reduce((sum, character) => sum + character.charCodeAt(0), 0)}`;
 
   const call = async (userID, actorId = '0') => {
     const body = new URLSearchParams({
@@ -276,14 +312,15 @@ async function requestProfileGraphQL() {
     return JSON.parse(text.replace(/^for\s*\(;;\);\s*/, ''));
   };
 
-  const viewerResponse = await call('1');
-  const viewer = viewerResponse?.data?.viewer?.user;
-  const userId = String(viewer?.id ?? viewer?.pk ?? cookieUserId()).trim();
-  if (!userId || userId === '0') return null;
+    const viewerResponse = await call('1');
+    const viewer = viewerResponse?.data?.viewer?.user;
+    const userId = String(viewer?.id ?? viewer?.pk ?? cookieUserId()).trim();
+    if (!userId || userId === '0') return null;
 
-  const profileResponse = await call(userId, userId);
-  const userDict = profileResponse?.data?.xig_user_by_igid_v2?.user_dict;
-  return mergeUsers(userDict, profileResponse?.data?.user, viewer, { pk: userId });
+    const profileResponse = await call(userId, userId);
+    const userDict = profileResponse?.data?.xig_user_by_igid_v2?.user_dict;
+    return mergeUsers(userDict, profileResponse?.data?.user, viewer, { pk: userId });
+  });
 }
 
 async function fetchFullUser() {
