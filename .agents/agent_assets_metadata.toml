@@ -1,0 +1,9 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "9MdZxJi13PlqHhpE_gWSF"
+uri = "file://artifacts/export/project.zip"
+type = "unspecified"
+title = "Project ZIP"
+description = "Imported project archive. Includes the source, browser extension, API server, shared libraries, and configuration files; excludes Git metadata, caches, local agent files, and dependencies."
