@@ -10,12 +10,36 @@ const INSTAGRAM_GRAPHQL_DOC_ID = '26785645987802781';
 const INSTAGRAM_APP_ID = '936619743392459';
 let downloadedResponseUser = null;
 const IG_CONTENT_REQUEST_MIN_GAP_MS = 1500;
+const IG_RATE_LIMIT_BLOCK_KEY = 'igRateLimitBlockedUntil';
+const IG_PUBLISH_MIN_GAP_MS = 15000;
 let contentRequestQueue = Promise.resolve();
 let lastContentRequestStartedAt = 0;
 let contentRateLimitBlockedUntil = 0;
 
+function readContentRateLimitUntil() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get([IG_RATE_LIMIT_BLOCK_KEY], (stored) => {
+        const persisted = Number(stored?.[IG_RATE_LIMIT_BLOCK_KEY]) || 0;
+        contentRateLimitBlockedUntil = Math.max(contentRateLimitBlockedUntil, persisted);
+        resolve(contentRateLimitBlockedUntil);
+      });
+    } catch {
+      resolve(contentRateLimitBlockedUntil);
+    }
+  });
+}
+
+function persistContentRateLimit(until) {
+  contentRateLimitBlockedUntil = Math.max(contentRateLimitBlockedUntil, until);
+  try {
+    chrome.storage.local.set({ [IG_RATE_LIMIT_BLOCK_KEY]: contentRateLimitBlockedUntil });
+  } catch {}
+}
+
 function withContentRequestSlot(task) {
   const run = contentRequestQueue.then(async () => {
+    await readContentRateLimitUntil();
     if (contentRateLimitBlockedUntil > Date.now()) {
       const waitMinutes = Math.ceil((contentRateLimitBlockedUntil - Date.now()) / 60000);
       throw new Error(`Instagram rate-limit cooldown aktif — ${waitMinutes} dk daha bekleniyor (429)`);
@@ -30,7 +54,7 @@ function withContentRequestSlot(task) {
       return await task();
     } catch (error) {
       if (/(?:\b429\b|rate[\s_-]*limit|feedback_required|please wait|try again later|spam)/i.test(String(error?.message ?? error))) {
-        contentRateLimitBlockedUntil = Math.max(contentRateLimitBlockedUntil, Date.now() + 30 * 60000);
+        persistContentRateLimit(Date.now() + 30 * 60000);
       }
       throw error;
     }
@@ -369,7 +393,10 @@ let lastPublishedAt = 0;
 async function publishUser(force = false) {
   const now = Date.now();
   if (publishInFlight) return publishInFlight;
-  if (!force && now - lastPublishedAt < 15000) return null;
+  // A UI refresh must not turn the profile fallback chain into a request
+  // flood. "force" bypasses the normal stale-data decision, not this
+  // anti-burst guard.
+  if (now - lastPublishedAt < IG_PUBLISH_MIN_GAP_MS) return null;
 
   lastPublishedAt = now;
   publishInFlight = (async () => {

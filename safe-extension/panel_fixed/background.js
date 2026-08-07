@@ -25,6 +25,8 @@ const IG_REQUEST_MIN_GAP_MS = 1500;
 const IG_RATE_LIMIT_BLOCK_KEY = 'igRateLimitBlockedUntil';
 const IG_SESSION_PROBE_KEY = 'igSessionProbeAt';
 const IG_SESSION_PROBE_MIN_GAP_MS = 60 * 1000;
+const IG_MAX_FOLLOWING_PAGES = 4;
+const IG_MAX_LIST_PAGE_SIZE = 50;
 let _igRequestQueue = Promise.resolve();
 let _lastIgRequestStartedAt = 0;
 let _igRequestBlockedUntil = 0;
@@ -43,6 +45,16 @@ function withInstagramRequestSlot(operation, task) {
     // Service workers can receive a message before the async storage read above
     // has completed. Do not let that race bypass a persisted cooldown.
     await _igRequestBlockReady;
+    // The isolated-world content script can also observe a server-side limit.
+    // Re-read the persisted value before every request so that a cooldown
+    // created there immediately protects this queue as well.
+    const stored = await new Promise(resolve =>
+      chrome.storage.local.get([IG_RATE_LIMIT_BLOCK_KEY], resolve)
+    );
+    _igRequestBlockedUntil = Math.max(
+      _igRequestBlockedUntil,
+      Number(stored?.[IG_RATE_LIMIT_BLOCK_KEY]) || 0,
+    );
     if (_igRequestBlockedUntil > Date.now()) {
       const waitMinutes = Math.ceil((_igRequestBlockedUntil - Date.now()) / 60000);
       throw new Error(`Instagram rate-limit cooldown aktif — ${waitMinutes} dk daha bekleniyor (429)`);
@@ -929,10 +941,10 @@ async function getFollowing(userId) {
     const seenUsers = new Set();
     let maxId = null;
     let pages = 0;
-    const MAX_PAGES = 8;
+    const MAX_PAGES = IG_MAX_FOLLOWING_PAGES;
     do {
       if (pages > 0) await sleep(randInt(900, 1800));
-      const params = { count: '50' };
+      const params = { count: String(IG_MAX_LIST_PAGE_SIZE) };
       if (maxId) params.max_id = maxId;
       const data = await igFetchViaContentScript(
         `/api/v1/friendships/${userId}/following/`, params
@@ -984,10 +996,10 @@ async function getFollowing(userId) {
     const seenUsers = new Set();
     let maxId = null;
     let pages = 0;
-    const MAX_PAGES = 8;
+    const MAX_PAGES = IG_MAX_FOLLOWING_PAGES;
     do {
       if (pages > 0) await sleep(randInt(900, 1800));
-      const params = { count: '50' };
+      const params = { count: String(IG_MAX_LIST_PAGE_SIZE) };
       if (maxId) params.max_id = maxId;
       const data = await apiCall(`/api/v1/friendships/${userId}/following/`, params);
       const rawUsers = extractFollowUsers(data);
@@ -1826,7 +1838,10 @@ async function runAutolikeTick() {
           }
         }
       } catch (e) {
-        if (isRateLimitMessage(e) || isInstagramCheckpointError(e)) throw e;
+        // A blocked/authenticated response must stop the whole tick. Continuing
+        // with the next content type or candidate would multiply the same
+        // server-side protection into several more requests.
+        if (isAutomationStopError(e)) throw e;
         const isEmptyResponse = isTransientTabIssue(e);
         const errorMessage = e?.message || String(e);
         setContentStatus(contentStatus.story, {
@@ -1911,7 +1926,9 @@ async function runAutolikeTick() {
             }
           }
         } catch (e) {
-          if (isRateLimitMessage(e) || isInstagramCheckpointError(e)) throw e;
+          // Do not fan out after a 401/403, challenge, throttle, or unusable
+          // Instagram tab. The outer handler applies one shared backoff.
+          if (isAutomationStopError(e)) throw e;
           const isEmptyResponse = isTransientTabIssue(e);
           const errorMessage = e?.message || String(e);
           setContentStatus(contentStatus.post, {
@@ -1985,7 +2002,9 @@ async function runAutolikeTick() {
             }
           }
         } catch (e) {
-          if (isRateLimitMessage(e) || isInstagramCheckpointError(e)) throw e;
+          // Stop the tick on server enforcement instead of probing the
+          // remaining candidates/content types.
+          if (isAutomationStopError(e)) throw e;
           const isEmptyResponse = isTransientTabIssue(e);
           const errorMessage = e?.message || String(e);
           setContentStatus(contentStatus.reel, {
@@ -2273,28 +2292,37 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       reply({ ok: false, error: 'Hikaye işlemi zaten devam ediyor — ikinci istek gönderilmedi' });
       return false;
     }
-    chrome.tabs.query({ url: '*://*.instagram.com/*' }, tabs => {
-      const tab = tabs.find(t =>
-        t.id != null &&
-        t.status === 'complete' &&
-        !t.url?.includes('/accounts/')
-      ) ?? tabs.find(t => t.id != null && t.status === 'complete');
-      if (!tab?.id) {
-        reply({ ok: false, error: 'Açık Instagram sekmesi bulunamadı' });
-        return;
-      }
-      _domStoryLikeInFlight = true;
-      chrome.tabs.sendMessage(tab.id, { type: 'DOM_LIKE_STORY', like: msg.like }, res => {
-        _domStoryLikeInFlight = false;
-        if (chrome.runtime.lastError || !res) {
-          reply({ ok: false, error: 'Content script yanıt vermedi' });
-          return;
-        }
-        reply(res.ok
-          ? { ok: true }
-          : { ok: false, error: "Hikaye butonu DOM'da bulunamadı" });
-      });
-    });
+    _domStoryLikeInFlight = true;
+    withInstagramRequestSlot(
+      'dom-story-like',
+      () => new Promise((resolve, reject) => {
+        chrome.tabs.query({ url: '*://*.instagram.com/*' }, tabs => {
+          const tab = tabs.find(t =>
+            t.id != null &&
+            t.status === 'complete' &&
+            !t.url?.includes('/accounts/')
+          ) ?? tabs.find(t => t.id != null && t.status === 'complete');
+          if (!tab?.id) {
+            reject(new Error('Açık Instagram sekmesi bulunamadı'));
+            return;
+          }
+          chrome.tabs.sendMessage(tab.id, { type: 'DOM_LIKE_STORY', like: msg.like }, res => {
+            if (chrome.runtime.lastError || !res) {
+              reject(new Error('Content script yanıt vermedi'));
+              return;
+            }
+            if (!res.ok) {
+              reject(new Error("Hikaye butonu DOM'da bulunamadı"));
+              return;
+            }
+            resolve({ ok: true });
+          });
+        });
+      }),
+    ).then(
+      result => reply(result),
+      error => reply({ ok: false, error: error.message || String(error) }),
+    ).finally(() => { _domStoryLikeInFlight = false; });
     return true;
   }
 

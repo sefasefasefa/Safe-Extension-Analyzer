@@ -54,8 +54,7 @@
   "host_permissions": [
     "*://*.instagram.com/*",
     "*://*.fbcdn.net/*",
-    "*://*.cdninstagram.com/*",
-    "<all_urls>"
+    "*://*.cdninstagram.com/*"
   ],
   "declarative_net_request": {
     "rule_resources": [

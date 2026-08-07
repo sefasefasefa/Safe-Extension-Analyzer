@@ -1,0 +1,1 @@
+- [Instagram request safety](instagram-request-safety.md) — keep rate-limit/session stops shared across extension worlds and fail closed after server enforcement.
