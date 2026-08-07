@@ -1,45 +1,38 @@
-# [Project name]
+# Safe Extension Analyzer
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Bu proje, Instagram üzerinde çalışan Manifest V3 tarayıcı uzantısının içe aktarılmış ve güvenli davranışlarla düzenlenmiş sürümüdür.
 
-## Run & Operate
+## Kullanım
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Uzantı dosyaları: `safe-extension/panel_fixed/`
+- Chrome veya Edge: geliştirici modunu açıp `safe-extension/panel_fixed/` klasörünü paketsiz uzantı olarak yükleyin.
+- Firefox: `safe-extension/panel_fixed/manifest.json` dosyasını geçici eklenti olarak yükleyin.
 
-## Stack
+## Güvenlik kararları
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Instagram oturum çerezi değiştiğinde panel otomatik açılmaz.
+- Uzantı artık arka planda Instagram sekmesi oluşturmaz.
+- Çıkış/temizleme işlemi Instagram çerezlerini silmez ve açık sekmeleri yönlendirmez; yalnızca uzantının yerel verilerini temizler.
+- Paneldeki genel tıklama dinleyicisi kaldırıldı; sıradan sayfa tıklamaları logout başlatamaz.
+- Oturum yoksa otomasyon duraklatılır, ancak kullanıcı login/logout sayfasına zorla gönderilmez.
+- Instagram sekmesi ve liste sayfası navigasyonu yalnızca kullanıcı panelde ilgili işlemi başlattığında kullanılır.
 
-## Where things live
+## Doğrulama
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- Tüm JavaScript dosyaları `node --check` ile kontrol edildi.
+- `manifest.json` geçerli JSON olarak doğrulandı.
 
-## Architecture decisions
+## Proje haritası
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
-
-## Product
-
-_Describe the high-level user-facing capabilities of this app once they exist._
+- `safe-extension/panel_fixed/manifest.json` — uzantı izinleri ve giriş noktaları
+- `safe-extension/panel_fixed/background.js` — servis worker, otomasyon ve güvenli oturum durdurma
+- `safe-extension/panel_fixed/content-script.js` — açık Instagram sekmesindeki kontrollü istekler
+- `safe-extension/panel_fixed/page-data-bridge.js` — sayfa yanıtlarını gözlemleyen köprü
+- `safe-extension/panel_fixed/logout-handler.js` — yalnızca uzantı yerel verilerini temizleyen panel düğmesi
+- `safe-extension/panel_fixed/popup-logout.js` — popup içindeki aynı temizleme işlemi
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
-
-## Gotchas
-
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Mevcut tarayıcı uzantısı yapısını koru.
+- Instagram oturum, çerez ve rate-limit işlemlerinde fail-closed davran.
+- Kullanıcı açıkça istemedikçe sekme açma, yönlendirme veya üçüncü taraf çerezlerini değiştirme.

@@ -1,0 +1,1 @@
+- [Extension navigation safety](extension-navigation-safety.md) — local cleanup must never delete Instagram cookies or navigate existing tabs; new tabs require explicit user action.

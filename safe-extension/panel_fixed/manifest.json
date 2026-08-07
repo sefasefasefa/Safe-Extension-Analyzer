@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "Takipçi Paneli",
+  "version": "1.0.16",
+  "description": "Takipçi Paneli — Instagram takip & otomasyon paneli · Powered by Rodon (rodon.studio). Chrome, Edge ve Firefox ile uyumlu.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    },
+    "default_title": "Takipçi Paneli · RODON",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.instagram.com/*"
+      ],
+      "js": [
+        "page-data-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.instagram.com/*"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "cookies",
+    "storage",
+    "tabs",
+    "windows",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "*://*.instagram.com/*"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "takipci-paneli@extension",
+      "strict_min_version": "128.0"
+    }
+  }
+}
