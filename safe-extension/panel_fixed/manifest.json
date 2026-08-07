@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "Takipçi Paneli",
+  "version": "1.1.0-safe",
+  "description": "Takipçi Paneli — Instagram işlemlerini dar izinler, tekilleştirme ve güvenli hız sınırlarıyla yönetir.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    },
+    "default_title": "Takipçi Paneli · RODON",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.instagram.com/*"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.instagram.com/*"
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "takipci-paneli@extension",
+      "strict_min_version": "128.0"
+    }
+  }
+}

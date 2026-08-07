@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Takipçi Paneli</title>
+    <script src="./status-label-fix.js"></script>
+    <script src="./safe-api-shim.js"></script>
+    <script type="module" src="./panel.js"></script>
+    <link rel="modulepreload" href="./chunks/refresh-cw-Cj1OSWWq.js">
+    <link rel="stylesheet" href="./panel.css">
+    <style>
+      /* ── Dashboard Overlay — nav alanını (60px) boş bırak ── */
+      #dash-overlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 60px; /* alt nav görünür kalsın */
+        z-index: 9999;
+        background: #0a0a0f;
+        flex-direction: column;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        -webkit-font-smoothing: antialiased;
+        overflow: hidden;
+      }
+      #dash-overlay.open { display: flex; }
+
+      .dov-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        background: rgba(10,10,15,0.98);
+        flex-shrink: 0;
+      }
+      .dov-logo {
+        width: 28px; height: 28px;
+        border-radius: 8px;
+        background: linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0;
+      }
+      .dov-logo svg { width: 14px; height: 14px; fill: #fff; }
+      .dov-title { font-size: 14px; font-weight: 700; color: #f0f0f8; letter-spacing: -0.2px; }
+      .dov-sub { font-size: 9px; font-family: monospace; letter-spacing: 1.5px; text-transform: uppercase; background: linear-gradient(90deg,#833ab4,#fd1d1d); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+      .dov-refresh {
+        margin-left: auto;
+        width: 28px; height: 28px;
+        border-radius: 7px;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(255,255,255,0.04);
+        color: #6b7280;
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+      .dov-refresh:hover { background: rgba(255,255,255,0.09); color: #f0f0f8; }
+      .dov-refresh svg { width: 13px; height: 13px; }
+      .dov-refresh.spin svg { animation: dov-spin 0.7s linear infinite; }
+      @keyframes dov-spin { to { transform: rotate(360deg); } }
+
+      /* Rodon markası — görünür ama minimal */
+      .dov-sub .rodon-mark {
+        background: linear-gradient(90deg,#833ab4,#fd1d1d);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        font-weight: 800; letter-spacing: 2.2px; margin-right: 6px;
+      }
+      .dov-powered {
+        margin-top: 14px; padding: 10px 14px;
+        text-align: center; font-family: monospace;
+        font-size: 9px; letter-spacing: 2.2px; text-transform: uppercase;
+        color: #4b5563; border-top: 1px solid rgba(255,255,255,0.05);
+      }
+      .dov-powered .rodon-mark {
+        background: linear-gradient(90deg,#833ab4,#fd1d1d,#fcb045);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        font-weight: 800; letter-spacing: 3px; margin-right: 4px;
+      }
+      .dov-powered a { color: #6b7280; text-decoration: none; }
+      .dov-powered a:hover { color: #c084fc; }
+
+      .dov-body {
+        flex: 1;
+        overflow-y: auto;
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255,255,255,0.07) transparent;
+      }
+      .dov-body::-webkit-scrollbar { width: 3px; }
+      .dov-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
+
+      /* Stat Grid */
+      .dov-stat-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 8px;
+      }
+      .dov-stat {
+        background: #15151e;
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 12px;
+        padding: 12px;
+        position: relative;
+        overflow: hidden;
+        transition: transform 0.2s;
+      }
+      .dov-stat:hover { transform: translateY(-1px); }
+      .dov-stat-glow {
+        position: absolute; inset: 0; border-radius: 12px; opacity: 0.07;
+      }
+      .dov-stat-icon { font-size: 16px; margin-bottom: 8px; display: block; }
+      .dov-stat-val { font-size: 22px; font-weight: 800; font-family: monospace; letter-spacing: -1px; line-height: 1; }
+      .dov-stat-lbl { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: #6b7280; margin-top: 3px; font-weight: 600; }
+      .dov-stat-sub { font-size: 9px; color: #4b5563; margin-top: 5px; font-family: monospace; }
+
+      .dov-stat.purple .dov-stat-glow { background: #833ab4; }
+      .dov-stat.purple .dov-stat-val { color: #c084fc; }
+      .dov-stat.red .dov-stat-glow { background: #fd1d1d; }
+      .dov-stat.red .dov-stat-val { color: #fb7185; }
+      .dov-stat.amber .dov-stat-glow { background: #fcb045; }
+      .dov-stat.amber .dov-stat-val { color: #fbbf24; }
+      .dov-stat.blue .dov-stat-glow { background: #3b82f6; }
+      .dov-stat.blue .dov-stat-val { color: #60a5fa; }
+
+      .dov-progress { height: 3px; background: #1c1c28; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+      .dov-progress-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg,#833ab4,#fd1d1d); transition: width 0.5s; }
+
+      /* Section Label */
+      .dov-section {
+        font-size: 9px; font-family: monospace; text-transform: uppercase;
+        letter-spacing: 2px; color: #4b5563; font-weight: 700;
+        margin-bottom: -6px;
+      }
+
+      /* Last Action */
+      .dov-last-action {
+        background: #15151e;
+        border: 1px solid rgba(34,197,94,0.2);
+        border-radius: 12px;
+        padding: 12px 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .dov-last-action .icon { font-size: 18px; flex-shrink: 0; }
+      .dov-la-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #6b7280; font-weight: 700; }
+      .dov-la-val { font-size: 12px; font-weight: 600; color: #f0f0f8; margin-top: 2px; }
+      .dov-la-time { margin-left: auto; text-align: right; flex-shrink: 0; }
+      .dov-la-time .dov-la-label { text-align: right; }
+      .dov-la-ts { font-size: 11px; font-family: monospace; color: #4ade80; margin-top: 2px; }
+
+      /* Tabs */
+      .dov-tab-bar {
+        display: flex; gap: 3px;
+        background: #15151e;
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 10px;
+        padding: 3px;
+      }
+      .dov-tab {
+        flex: 1; padding: 7px 6px;
+        border-radius: 7px; border: none; background: transparent;
+        color: #6b7280; font-size: 9px; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.8px;
+        cursor: pointer; transition: all 0.2s; font-family: inherit;
+      }
+      .dov-tab.active { background: linear-gradient(135deg, #833ab4, #fd1d1d); color: #fff; }
+      .dov-tab:not(.active):hover { background: rgba(255,255,255,0.05); color: #f0f0f8; }
+
+      /* Log Table */
+      .dov-log-card {
+        background: #15151e;
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      .dov-debug-card { margin-top:10px; background:rgba(10,10,18,.72); border:1px solid rgba(255,255,255,.08); border-radius:12px; overflow:hidden; }
+      .dov-debug-body { max-height:220px; overflow:auto; padding:8px 10px; font:10px/1.45 monospace; color:#9ca3af; }
+      .dov-debug-row { padding:6px 0; border-bottom:1px solid rgba(255,255,255,.05); white-space:pre-wrap; word-break:break-word; }
+      .dov-debug-row:last-child { border-bottom:0; }
+      .dov-debug-row.error { color:#fb7185; }
+      .dov-debug-row.warn { color:#fbbf24; }
+      .dov-debug-row.info { color:#a7f3d0; }
+      .dov-candidate-card { margin-top:10px; background:rgba(10,10,18,.72); border:1px solid rgba(255,255,255,.08); border-radius:12px; overflow:hidden; }
+      .dov-candidate-body { max-height:360px; overflow:auto; padding:8px 10px; }
+      .dov-candidate-row { padding:8px 0; border-bottom:1px solid rgba(255,255,255,.05); }
+      .dov-candidate-row:last-child { border-bottom:0; }
+      .dov-candidate-user { color:#f0f0f8; font-size:11px; font-weight:700; margin-right:7px; }
+      .dov-candidate-summary { color:#a7f3d0; font:10px/1.5 monospace; word-break:break-word; }
+      .dov-candidate-status b { color:#9ca3af; }
+      .dov-candidate-status.empty { color:#fbbf24; }
+      .dov-candidate-status.liked { color:#c4b5fd; }
+      .dov-candidate-status.error { color:#fb7185; }
+      .dov-log-head {
+        padding: 10px 14px;
+        display: flex; align-items: center; justify-content: space-between;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+      }
+      .dov-log-head-title { font-size: 12px; font-weight: 700; color: #f0f0f8; }
+      .dov-log-count { font-size: 9px; font-family: monospace; color: #6b7280; }
+      .dov-table { width: 100%; border-collapse: collapse; }
+      .dov-table th { padding: 6px 14px; text-align: left; font-size: 8px; text-transform: uppercase; letter-spacing: 1px; color: #4b5563; font-weight: 700; border-bottom: 1px solid rgba(255,255,255,0.05); background: rgba(0,0,0,0.2); }
+      .dov-table td { padding: 9px 14px; font-size: 11px; border-bottom: 1px solid rgba(255,255,255,0.04); vertical-align: middle; color: #d1d5db; }
+      .dov-table tr:last-child td { border-bottom: none; }
+      .dov-table tr:hover td { background: rgba(255,255,255,0.02); }
+      .dov-badge { display: inline-flex; align-items: center; gap: 3px; padding: 2px 7px; border-radius: 20px; font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+      .dov-badge.story { background: rgba(131,58,180,0.2); color: #c084fc; }
+      .dov-badge.post  { background: rgba(253,29,29,0.18); color: #fb7185; }
+      .dov-badge.reel  { background: rgba(252,176,69,0.18); color: #fbbf24; }
+      .dov-empty { padding: 30px 14px; text-align: center; color: #4b5563; }
+      .dov-empty p { font-size: 11px; margin-top: 6px; }
+
+      /* ── Dashboard Nav Butonu (nav'a enjekte edilir) ── */
+      #dash-nav-btn {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        border-radius: 12px;
+        margin: 0 2px;
+        position: relative;
+        padding: 0;
+        transition: color 0.2s;
+        color: #6b7280;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        -webkit-font-smoothing: antialiased;
+        min-width: 0;
+      }
+      #dash-nav-btn:hover { color: rgba(255,255,255,0.7); }
+      #dash-nav-btn.active { color: #fff; }
+      #dash-nav-btn .dash-nav-bg {
+        display: none;
+        position: absolute;
+        inset: 4px;
+        border-radius: 12px;
+        background: linear-gradient(135deg, #833ab4, #fd1d1d, #fcb045);
+        opacity: 0.9;
+      }
+      #dash-nav-btn.active .dash-nav-bg { display: block; }
+      #dash-nav-btn .dash-nav-inner {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+      }
+      #dash-nav-btn svg {
+        width: 15px;
+        height: 15px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- Dashboard Analytics Overlay — alt nav alanını kapatmaz (bottom: 60px) -->
+    <div id="dash-overlay">
+      <div class="dov-header">
+        <div class="dov-logo">
+          <svg viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        </div>
+        <div>
+          <div class="dov-title">Dashboard</div>
+          <div class="dov-sub"><span class="rodon-mark">RODON</span>Beğeni Analitik</div>
+        </div>
+        <button class="dov-refresh" id="dovRefreshBtn" title="Yenile">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="dov-body" id="dovBody">
+        <!-- Stats -->
+        <div class="dov-stat-grid">
+          <div class="dov-stat purple" style="grid-column:1/-1;">
+            <div class="dov-stat-glow"></div>
+            <span class="dov-stat-icon">❤️</span>
+            <div class="dov-stat-val" id="dov-today">0</div>
+            <div class="dov-stat-lbl">Bugün Beğeni</div>
+            <div class="dov-progress"><div class="dov-progress-fill" id="dov-prog" style="width:0%"></div></div>
+            <div class="dov-stat-sub" id="dov-limit">/ — limit</div>
+          </div>
+          <div class="dov-stat red">
+            <div class="dov-stat-glow"></div>
+            <span class="dov-stat-icon">📸</span>
+            <div class="dov-stat-val" id="dov-posts">0</div>
+            <div class="dov-stat-lbl">Gönderi</div>
+            <div class="dov-stat-sub" id="dov-posts-sub">—</div>
+          </div>
+          <div class="dov-stat purple">
+            <div class="dov-stat-glow"></div>
+            <span class="dov-stat-icon">🎬</span>
+            <div class="dov-stat-val" id="dov-stories">0</div>
+            <div class="dov-stat-lbl">Hikaye</div>
+            <div class="dov-stat-sub" id="dov-stories-sub">—</div>
+          </div>
+          <div class="dov-stat amber">
+            <div class="dov-stat-glow"></div>
+            <span class="dov-stat-icon">▶</span>
+            <div class="dov-stat-val" id="dov-reels">0</div>
+            <div class="dov-stat-lbl">Reels</div>
+            <div class="dov-stat-sub" id="dov-reels-sub">—</div>
+          </div>
+          <div class="dov-stat blue">
+            <div class="dov-stat-glow"></div>
+            <span class="dov-stat-icon">📅</span>
+            <div class="dov-stat-val" id="dov-total">0</div>
+            <div class="dov-stat-lbl">Toplam Kayıt</div>
+            <div class="dov-stat-sub" id="dov-total-sub">—</div>
+          </div>
+        </div>
+
+        <!-- Last Action -->
+        <div class="dov-last-action" id="dov-last-action" style="display:none">
+          <div class="icon">⚡</div>
+          <div>
+            <div class="dov-la-label">Son İşlem</div>
+            <div class="dov-la-val" id="dov-la-val">—</div>
+          </div>
+          <div class="dov-la-time">
+            <div class="dov-la-label">Saat</div>
+            <div class="dov-la-ts" id="dov-la-ts">—</div>
+          </div>
+        </div>
+
+        <div class="dov-candidate-card">
+          <div class="dov-log-head">
+            <div class="dov-log-head-title">Son Hesap Kontrol Sonuçları</div>
+            <div class="dov-log-count" id="dov-candidate-count">0 hesap</div>
+          </div>
+          <div class="dov-candidate-body" id="dov-candidate-body">
+            Henüz hesap kontrolü tamamlanmadı.
+          </div>
+        </div>
+
+        <!-- Log Table -->
+        <div class="dov-section">📋 Aktivite Günlüğü</div>
+
+        <div class="dov-tab-bar">
+          <button class="dov-tab active" data-tab="all">Tümü</button>
+          <button class="dov-tab" data-tab="story">Hikaye</button>
+          <button class="dov-tab" data-tab="post">Gönderi</button>
+          <button class="dov-tab" data-tab="reel">Reels</button>
+        </div>
+
+        <div class="dov-log-card">
+          <div class="dov-log-head">
+            <div class="dov-log-head-title">Beğeni Geçmişi</div>
+            <div class="dov-log-count" id="dov-log-count">0 kayıt</div>
+          </div>
+          <div class="dov-card-grid" id="dov-card-grid"></div>
+        </div>
+
+        <div class="dov-debug-card">
+          <div class="dov-log-head">
+            <div class="dov-log-head-title">Otomasyon Hata / İşlem Logları</div>
+            <div class="dov-log-count" id="dov-debug-count">0 kayıt</div>
+          </div>
+          <div class="dov-debug-body" id="dov-debug-body">
+            Henüz otomasyon logu yok. Yenilemeden sonra istek ve hata sonuçları burada görünür.
+          </div>
+        </div>
+
+        <div style="height:8px"></div>
+
+        <div class="dov-powered">
+          <span class="rodon-mark">RODON</span>· Powered by
+          <a href="https://www.instagram.com/" target="_blank" rel="noopener">rodon.studio</a>
+        </div>
+      </div><!-- /dov-body -->
+    </div><!-- /dash-overlay -->
+
+    <script src="./dashboard.js"></script>
+    <script src="./logout-handler.js"></script>
+    <script src="./inject-nav.js"></script>
+    <script src="./readonly-like-status.js"></script>
+    <script src="./settings-card.js" defer></script>
+  </body>
+</html>

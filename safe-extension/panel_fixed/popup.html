@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ayarlar · RODON</title>
+    <script src="./safe-api-shim.js"></script>
+    <script type="module" src="./popup.js"></script>
+    <link rel="stylesheet" href="./panel.css">
+    <style>
+      /* Popup boyut garantisi — React yüklenemese bile popup görünür olur */
+      html, body {
+        min-width: 280px;
+        min-height: 60px;
+        background: #09090b;
+        color: #fafafa;
+        margin: 0;
+        padding: 0;
+      }
+      /* Settings card slot — popup için minimal konteynır */
+      #dov-s-slot { padding: 4px 6px 0; }
+
+      /* Rodon brand footer — minimal */
+      .brand-foot {
+        padding: 6px 12px 8px;
+        text-align: center;
+        font-family: monospace;
+        font-size: 8px;
+        letter-spacing: 2.2px;
+        text-transform: uppercase;
+        color: #4b5563;
+        border-top: 1px solid rgba(255,255,255,0.05);
+      }
+      .brand-foot .rodon-mark {
+        background: linear-gradient(90deg,#833ab4,#fd1d1d,#fcb045);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        font-weight: 800; letter-spacing: 2.5px; margin-right: 4px;
+      }
+      .brand-foot a { color: #6b7280; text-decoration: none; }
+      .brand-foot a:hover { color: #c084fc; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- ╔══════ AYLAR — Otomasyon için içerik türü seçimi ══════╗ -->
+    <div class="dov-s-section-title">⚙ Ayarlar</div>
+    <div id="dov-s-slot"></div>
+
+    <div class="brand-foot">
+      <span class="rodon-mark">RODON</span>Powered by rodon.studio
+    </div>
+    <script src="./popup-init.js"></script>
+    <script src="./popup-logout.js"></script>
+    <script src="./settings-card.js" defer></script>
+  </body>
+</html>

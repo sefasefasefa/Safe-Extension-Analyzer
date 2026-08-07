@@ -1,0 +1,1 @@
+- [Extension safety baseline](extension-safety-baseline.md) — Keep the Instagram extension least-privilege, single-flight, and explicitly rate-limited.
