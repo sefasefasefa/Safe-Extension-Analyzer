@@ -25,6 +25,24 @@ function isRateLimitMessage(error) {
   return /(?:\b429\b|rate[\s_-]*limit|feedback_required|please wait|try again later|spam)/i.test(message);
 }
 
+function isSessionError(error) {
+  const message = String(error?.message ?? error ?? '');
+  return /(?:\b401\b|\b403\b|login_required|session(?:id)?[_\s-]*(?:expired|invalid|required)|oturum süresi dolmuş|oturum geçersiz)/i.test(message);
+}
+
+async function hasInstagramSessionCookie() {
+  try {
+    const direct = await new Promise(resolve =>
+      chrome.cookies.get({ url: 'https://www.instagram.com', name: 'sessionid' }, resolve)
+    );
+    if (direct?.value) return true;
+    const all = await chrome.cookies.getAll({ domain: 'instagram.com' });
+    return all.some(cookie => cookie.name === 'sessionid' && cookie.value);
+  } catch {
+    return false;
+  }
+}
+
 // Instagram checkpoint/doğrulama hataları — kullanıcı arayüzünden onay gerektirir.
 // Bu hatalar bir kod hatası değil; kullanıcı Instagram'da manuel olarak
 // doğrulama yaparsa otomasyon kaldığı yerden devam eder.
@@ -53,6 +71,8 @@ function isTransientTabIssue(error) {
 // DevTools → Uygulama → Depolama → OPFS bölümünden erişilebilir.
 const OPFS_LOG_FILE    = 'automation_log.ndjson';
 const OPFS_SIZE_LIMIT  = 1_000_000_000; // 1 GB
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function opfsWriteLog(kind, entry) {
   try {
@@ -108,6 +128,22 @@ const DEFAULT_STATE = {
   sessionUserId: '',
   sessionCheckedAt: 0,
 };
+
+function normalizeAutomationState(state) {
+  const normalized = { ...DEFAULT_STATE, ...(state ?? {}) };
+  // Treat these as hard safety bounds, not UI suggestions. Older builds and
+  // direct storage edits must not be able to bypass the rate-limit guard.
+  normalized.minDelaySec = Math.max(65, Math.min(3600, Number(normalized.minDelaySec) || DEFAULT_STATE.minDelaySec));
+  normalized.maxDelaySec = Math.max(
+    normalized.minDelaySec,
+    Math.min(3600, Number(normalized.maxDelaySec) || DEFAULT_STATE.maxDelaySec),
+  );
+  normalized.maxPerDay = Math.max(1, Math.min(50, Number(normalized.maxPerDay) || DEFAULT_STATE.maxPerDay));
+  normalized.maxPerHour = Math.max(1, Math.min(35, Number(normalized.maxPerHour) || DEFAULT_STATE.maxPerHour));
+  normalized.batchSize = Math.max(1, Math.min(10, Number(normalized.batchSize) || DEFAULT_STATE.batchSize));
+  normalized.batchPauseSec = Math.max(300, Math.min(3600, Number(normalized.batchPauseSec) || DEFAULT_STATE.batchPauseSec));
+  return normalized;
+}
 
 // ── "Zaten beğenilmiş" medya ID'leri (tekrar beğenmemek için) ─────────
 // Instagram'ın "PolarisProfileLikeListQuery" döndüğü zaman bile nadiren
@@ -188,7 +224,7 @@ function getState() {
   return new Promise(resolve =>
     chrome.storage.local.get([STATE_KEY], data => {
       const saved = data[STATE_KEY] ?? {};
-      const state = { ...DEFAULT_STATE, ...saved };
+      const state = normalizeAutomationState(saved);
       // Unconditionally enforce 24/7 — automation never has a time window.
       state.timeFrom = 0;
       state.timeTo = 24;
@@ -209,8 +245,8 @@ function getState() {
 function patchState(patch) {
   return new Promise(resolve =>
     chrome.storage.local.get([STATE_KEY], data => {
-      const current = { ...DEFAULT_STATE, ...(data[STATE_KEY] ?? {}) };
-      chrome.storage.local.set({ [STATE_KEY]: { ...current, ...patch } }, resolve);
+      const current = normalizeAutomationState(data[STATE_KEY]);
+      chrome.storage.local.set({ [STATE_KEY]: normalizeAutomationState({ ...current, ...patch }) }, resolve);
     })
   );
 }
@@ -292,7 +328,10 @@ async function runGraphQLMutation(docId, variables, friendlyName) {
     chrome.storage.local.get(['igUser', 'igGqlTokens'], resolve)
   );
   const igUser      = storage.igUser;
-  const igGqlTokens = storage.igGqlTokens;
+  const igGqlTokens = storage.igGqlTokens?.ts &&
+    Date.now() - Number(storage.igGqlTokens.ts) < 10 * 60 * 1000
+    ? storage.igGqlTokens
+    : null;
   const userId      = String(igUser?.pk ?? igUser?.fbid_v2 ?? '');
 
   let lastError;
@@ -477,7 +516,7 @@ async function likeMediaWithREST(mediaId) {
       return true;
     } catch (error) {
       lastError = error;
-      if (isPortClosedError(error) && attempt === 0) {
+      if ((isPortClosedError(error) || isTransientTabIssue(error)) && attempt === 0) {
         await appendDebugLog('warn', 'REST beğeni bağlantı hatası, yeniden deneniyor', { mediaId, error: error.message });
         continue;
       }
@@ -497,7 +536,11 @@ async function likeMediaWithGraphQL(mediaId, type) {
     return;
   } catch (restError) {
     const restMsg = restError?.message ?? '';
-    if (isRateLimitMessage(restError)) throw restError;
+    if (isRateLimitMessage(restError) ||
+        isSessionError(restError) ||
+        isTransientTabIssue(restError)) {
+      throw restError;
+    }
     // REST'ten gelen gerçek checkpoint/challenge → fırlat
     if (isInstagramCheckpointError(restError) && !restMsg.includes('1357004')) throw restError;
     // Gönderi/Reel: GraphQL'e düşme, REST hatayı dışarı ver
@@ -710,6 +753,7 @@ function focusTabSafely(tab) {
 // ── Takip listesi önbelleği (4 saat) ─────────────────────────────────
 let _followingCache = [];
 let _followingCacheTs = 0;
+let _followingCacheUserId = '';
 
 // Yanıt nesnesinden kullanıcı listesini çıkar — Instagram farklı şekillerde döndürebilir.
 function extractFollowUsers(data) {
@@ -760,7 +804,10 @@ async function igFetchViaContentScript(endpoint, params) {
 }
 
 async function getFollowing(userId) {
-  if (_followingCache.length > 0 && Date.now() - _followingCacheTs < 4 * 3600000) {
+  const normalizedUserId = String(userId ?? '');
+  if (_followingCache.length > 0 &&
+      _followingCacheUserId === normalizedUserId &&
+      Date.now() - _followingCacheTs < 4 * 3600000) {
     return _followingCache;
   }
 
@@ -772,11 +819,14 @@ async function getFollowing(userId) {
     );
     const cached = stored.__cached_following;
     const cacheAge = cached?.ts ? Date.now() - cached.ts : Infinity;
-    if (Array.isArray(cached?.users) && cached.users.length > 0 && cacheAge < 4 * 3600000) {
+    if (cached?.userId && String(cached.userId) === normalizedUserId &&
+        Array.isArray(cached.users) && cached.users.length > 0 &&
+        cacheAge < 4 * 3600000) {
       const allUsers = cached.users.map(normalizeFollowEntry).filter(Boolean);
       if (allUsers.length > 0) {
         _followingCache   = allUsers;
         _followingCacheTs = Date.now();
+        _followingCacheUserId = normalizedUserId;
         await appendDebugLog('info', `getFollowing: storage cache'ten ${allUsers.length} kullanıcı yüklendi`);
         return _followingCache;
       }
@@ -791,10 +841,12 @@ async function getFollowing(userId) {
   // reddettiriyor; content-script o başlığı hiç göndermez.
   try {
     const allUsers = [];
+    const seenUsers = new Set();
     let maxId = null;
     let pages = 0;
     const MAX_PAGES = 8;
     do {
+      if (pages > 0) await sleep(randInt(900, 1800));
       const params = { count: '50' };
       if (maxId) params.max_id = maxId;
       const data = await igFetchViaContentScript(
@@ -803,7 +855,10 @@ async function getFollowing(userId) {
       const rawUsers = extractFollowUsers(data);
       for (const u of rawUsers) {
         const entry = normalizeFollowEntry(u);
-        if (entry) allUsers.push(entry);
+        if (entry && !seenUsers.has(entry.id)) {
+          seenUsers.add(entry.id);
+          allUsers.push(entry);
+        }
       }
       await appendDebugLog('info', `getFollowing (CS): sayfa ${pages + 1} — ${rawUsers.length} ham, ${allUsers.length} toplam`, {
         responseKeys: Object.keys(data ?? {}).slice(0, 15),
@@ -815,15 +870,18 @@ async function getFollowing(userId) {
 
     _followingCache   = allUsers;
     _followingCacheTs = Date.now();
+    _followingCacheUserId = normalizedUserId;
     if (allUsers.length > 0) {
       // Service worker yeniden başladığında bellek sıfırlanır; storage'a da yaz.
-      chrome.storage.local.set({ __cached_following: { users: allUsers, ts: Date.now() } });
+      chrome.storage.local.set({ __cached_following: {
+        users: allUsers, userId: normalizedUserId, ts: Date.now(),
+      } });
       return _followingCache;
     }
     // 0 kullanıcı döndü — KAT 3'e geç
     lastError = new Error('Content-script isteği 0 kullanıcı döndürdü');
   } catch (err) {
-    if (isRateLimitMessage(err)) throw err;
+    if (isRateLimitMessage(err) || isSessionError(err) || isTransientTabIssue(err)) throw err;
     lastError = err;
     await appendDebugLog('warn', `getFollowing CS hata: ${String(err.message ?? err).slice(0, 200)}`);
   }
@@ -831,17 +889,22 @@ async function getFollowing(userId) {
   // KAT 3: execRestInTab (executeScript tabanlı yedek).
   try {
     const allUsers = [];
+    const seenUsers = new Set();
     let maxId = null;
     let pages = 0;
     const MAX_PAGES = 8;
     do {
+      if (pages > 0) await sleep(randInt(900, 1800));
       const params = { count: '50' };
       if (maxId) params.max_id = maxId;
       const data = await apiCall(`/api/v1/friendships/${userId}/following/`, params);
       const rawUsers = extractFollowUsers(data);
       for (const u of rawUsers) {
         const entry = normalizeFollowEntry(u);
-        if (entry) allUsers.push(entry);
+        if (entry && !seenUsers.has(entry.id)) {
+          seenUsers.add(entry.id);
+          allUsers.push(entry);
+        }
       }
       await appendDebugLog('info', `getFollowing (exec): sayfa ${pages + 1} — ${rawUsers.length} ham, ${allUsers.length} toplam`, {
         responseKeys: Object.keys(data ?? {}).slice(0, 15),
@@ -853,9 +916,12 @@ async function getFollowing(userId) {
 
     _followingCache   = allUsers;
     _followingCacheTs = Date.now();
+    _followingCacheUserId = normalizedUserId;
     if (allUsers.length > 0) {
       // Service worker yeniden başladığında bellek sıfırlanır; storage'a da yaz.
-      chrome.storage.local.set({ __cached_following: { users: allUsers, ts: Date.now() } });
+      chrome.storage.local.set({ __cached_following: {
+        users: allUsers, userId: normalizedUserId, ts: Date.now(),
+      } });
     }
     lastError = null;
   } catch (error) {
@@ -1099,7 +1165,7 @@ async function apiCall(endpoint, params, method = 'GET', body) {
       // Sekme değiştirmek yardımcı olmaz; yeniden deneme yapmadan doğrudan fırlat.
       // Loglama üst katmana (autolikeTick) bırakılır — böylece her tick için
       // tek bir 'warn' kaydı oluşur, mükerrer girdi olmaz.
-      if (e.message.includes('beklenmeyen HTML sayfası')) {
+      if (e.message.includes('beklenmeyen HTML sayfası') && method === 'GET') {
         // Instagram geçici throttle/redirect — 8-12 sn bekle, aynı sekmede bir kez daha dene.
         // Önceki sürümde burası anında throw ediyordu; throttle penceresi kısa olduğundan
         // kısa bir bekleme sonrası çoğu durumda başarılı olur.
@@ -1434,7 +1500,7 @@ function broadcastStatus() {
 }
 
 // ── Ana otomasyon tiki ────────────────────────────────────────────────
-async function autolikeTick() {
+async function runAutolikeTick() {
   const state = await getState();
   if (!state.enabled) return;
 
@@ -1536,9 +1602,10 @@ async function autolikeTick() {
     return;
   }
 
-  // Her tick'te 5 farklı aday kullanıcı seç (rastgele karıştır)
+  // Her tick'te en fazla 2 farklı aday kullanıcı seç (rastgele karıştır).
+  // Daha fazla aday gereksiz listeleme isteği üretir.
   const shuffled   = [...following].sort(() => Math.random() - 0.5);
-  const candidates = shuffled.slice(0, 3);
+  const candidates = shuffled.slice(0, 2);
 
   try {
     let liked = false;
@@ -1576,6 +1643,7 @@ async function autolikeTick() {
     // ═══════════════════════════════════════════════════════════════
     let _storyIdx = 0;
     if (hasStory) for (const cd of candidateData) {
+      if (liked) break;
       if (_storyIdx++ > 0) await new Promise(r => setTimeout(r, randInt(1500, 4000)));
       const { candidate, targetId, username, rawUsername, contentStatus } = cd;
       try {
@@ -1663,6 +1731,7 @@ async function autolikeTick() {
       if (hasStory) await new Promise(r => setTimeout(r, randInt(2000, 5000)));
       let _postIdx = 0;
       for (const cd of candidateData) {
+        if (liked) break;
         if (_postIdx++ > 0) await new Promise(r => setTimeout(r, randInt(1500, 4000)));
         const { candidate, targetId, username, rawUsername, contentStatus } = cd;
         try {
@@ -1673,6 +1742,11 @@ async function autolikeTick() {
               { count: '12' },
             );
           } catch (usernameError) {
+            if (isRateLimitMessage(usernameError) ||
+                isSessionError(usernameError) ||
+                isTransientTabIssue(usernameError)) {
+              throw usernameError;
+            }
             await appendDebugLog('warn', 'Gönderi kullanıcı adı isteği başarısız, kimlik ile tekrar deneniyor', {
               username: candidate.username,
               contentType: 'post',
@@ -1743,6 +1817,7 @@ async function autolikeTick() {
       if (hasStory || hasPost) await new Promise(r => setTimeout(r, randInt(2000, 5000)));
       let _reelIdx = 0;
       for (const cd of candidateData) {
+        if (liked) break;
         if (_reelIdx++ > 0) await new Promise(r => setTimeout(r, randInt(1500, 4000)));
         const { candidate, targetId, username, rawUsername, contentStatus } = cd;
         try {
@@ -1949,6 +2024,19 @@ async function autolikeTick() {
   }
 }
 
+// The one-minute alarm and the enable button can fire at the same time.
+// Prevent overlapping scans and duplicate likes before counters are persisted.
+let _autolikeInFlight = false;
+async function autolikeTick() {
+  if (_autolikeInFlight) return;
+  _autolikeInFlight = true;
+  try {
+    await runAutolikeTick();
+  } finally {
+    _autolikeInFlight = false;
+  }
+}
+
 // ── Instagram listelerini sayfa yönlendirme ile çekme ─────────────────
 // Instagram, eklenti içinden yapılan fetch isteklerini (hem executeScript
 // hem content-script isolated world) algılayıp login sayfasına yönlendiriyor.
@@ -1996,8 +2084,15 @@ async function fetchFollowListViaContentScript(endpoint, params, method, body, c
         chrome.runtime.onMessage.removeListener(listener);
         const users = Array.isArray(payload.users) ? payload.users : [];
         if (users.length > 0) {
-          chrome.storage.local.set({
-            [cacheKey]: { users, next_max_id: payload.next_max_id ?? null, ts: Date.now() },
+          chrome.storage.local.get(['igUser'], ({ igUser }) => {
+            chrome.storage.local.set({
+              [cacheKey]: {
+                users,
+                userId: String(igUser?.pk ?? igUser?.fbid_v2 ?? igUser?.id ?? ''),
+                next_max_id: payload.next_max_id ?? null,
+                ts: Date.now(),
+              },
+            });
           });
         }
         reply({ ok: true, data: { users, next_max_id: payload.next_max_id ?? null } });
@@ -2020,7 +2115,17 @@ async function fetchFollowListViaContentScript(endpoint, params, method, body, c
 // ── Mesaj dinleyicileri ───────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg.type === 'IG_USER_DATA') {
-    chrome.storage.local.set({ igUser: msg.user, igUserTs: Date.now() });
+    const nextUserId = String(msg.user?.pk ?? msg.user?.fbid_v2 ?? msg.user?.id ?? '');
+    chrome.storage.local.get(['igUser'], ({ igUser }) => {
+      const previousUserId = String(igUser?.pk ?? igUser?.fbid_v2 ?? igUser?.id ?? '');
+      if (nextUserId && previousUserId && nextUserId !== previousUserId) {
+        _followingCache = [];
+        _followingCacheTs = 0;
+        _followingCacheUserId = '';
+        chrome.storage.local.remove(['__cached_followers', '__cached_following']);
+      }
+      chrome.storage.local.set({ igUser: msg.user, igUserTs: Date.now() });
+    });
     const panelUrl = chrome.runtime.getURL('panel.html');
     chrome.tabs.query({}, tabs => {
       for (const tab of tabs) {
@@ -2203,18 +2308,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
         }
         // valid=false ama isRealLoginRedirect=false → geçici API sorunu, extension'ı kapatma
         broadcastStatus();
-        reply({
+        hasInstagramSessionCookie().then(sessionidPresent => reply({
           ok: true,
           valid,
           reason,
           httpStatus: r.status,
           username,
           userId,
-          sessionidPresent: true,
+          sessionidPresent,
           probePath: 'ig-tab',
           tabUrl: r.url,
           checkedAt: Date.now(),
-        });
+        }));
       }).catch(e => reply({ ok: false, error: e.message || String(e) }));
     });
     return true;
@@ -2226,8 +2331,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     for (const key of allowed) {
       if (key in msg.patch) patch[key] = msg.patch[key];
     }
-    if (patch.enabled === true) { patch.nextRunAt = 0; patch.backoffUntil = 0; }
-    patchState(patch).then(() => {
+    const enableAfterSessionCheck = patch.enabled === true
+      ? hasInstagramSessionCookie()
+      : Promise.resolve(true);
+    enableAfterSessionCheck.then(sessionPresent => {
+      if (patch.enabled === true && !sessionPresent) {
+        patch.enabled = false;
+        patch.backoffUntil = Date.now() + 30 * 60000;
+        patch.lastActionLabel = 'sessionid çerezi yok — önce instagram.com\\'a giriş yapın';
+      } else if (patch.enabled === true) {
+        patch.nextRunAt = 0;
+        patch.backoffUntil = 0;
+      }
+      return patchState(patch);
+    }).then(() => {
       broadcastStatus();
       reply({ ok: true });
       if (patch.enabled === true) {
@@ -2244,6 +2361,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg.type === 'IG_AUTO_CLEAR_CACHE') {
     _followingCache   = [];
     _followingCacheTs = 0;
+    _followingCacheUserId = '';
     reply({ ok: true });
     return false;
   }
@@ -2256,8 +2374,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       const payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload;
       if (payload?.kind && Array.isArray(payload.users) && payload.users.length > 0) {
         const key = payload.kind === 'followers' ? '__cached_followers' : '__cached_following';
-        chrome.storage.local.get([key], existing => {
-          const prev = existing[key] ?? { users: [], next_max_id: null, ts: 0 };
+        chrome.storage.local.get([key, 'igUser'], existing => {
+          const currentUserId = String(
+            existing.igUser?.pk ?? existing.igUser?.fbid_v2 ?? existing.igUser?.id ?? '',
+          );
+          const prev = existing[key]?.userId === currentUserId
+            ? existing[key]
+            : { users: [], next_max_id: null, ts: 0 };
           const merged = [...(Array.isArray(prev.users) ? prev.users : [])];
           const seen = new Set(merged.map(u => String(u?.pk ?? u?.id ?? '')));
           for (const u of payload.users) {
@@ -2267,6 +2390,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
           chrome.storage.local.set({
             [key]: {
               users: merged,
+              userId: currentUserId,
               // Do not overwrite an API pagination cursor with an unsolicited
               // page response from Instagram's UI.
               next_max_id: prev.next_max_id ?? null,
@@ -2290,9 +2414,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
       (async () => {
         // 1. Cache'te veri varsa ve ilk sayfa isteniyorsa cache'ten döndür
-        const stored = await new Promise(resolve => chrome.storage.local.get([cacheKey], resolve));
+        const stored = await new Promise(resolve =>
+          chrome.storage.local.get([cacheKey, 'igUser'], resolve)
+        );
         const cached = stored[cacheKey];
-        if (cached?.users?.length > 0 && !msg.params?.max_id) {
+        const currentUserId = String(
+          stored.igUser?.pk ?? stored.igUser?.fbid_v2 ?? stored.igUser?.id ?? '',
+        );
+        if (cached?.userId === currentUserId &&
+            cached?.users?.length > 0 && !msg.params?.max_id) {
           reply({ ok: true, data: { users: cached.users, next_max_id: cached.next_max_id ?? null } });
           return;
         }
@@ -2306,7 +2436,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
           const users = Array.isArray(data.users) ? data.users : [];
           if (users.length > 0) {
             chrome.storage.local.set({
-              [cacheKey]: { users, next_max_id: data.next_max_id ?? null, ts: Date.now() },
+              [cacheKey]: {
+                users,
+                userId: currentUserId,
+                next_max_id: data.next_max_id ?? null,
+                ts: Date.now(),
+              },
             });
           }
           reply({ ok: true, data: { users, next_max_id: data.next_max_id ?? null } });
@@ -2366,12 +2501,27 @@ async function performLogout() {
   const allCookies = await chrome.cookies.getAll({ domain: 'instagram.com' });
   for (const cookie of allCookies) {
     try {
-      await chrome.cookies.remove({ url: `https://${cookie.domain}${cookie.path}`, name: cookie.name });
+      await chrome.cookies.remove({
+        url: `https://${cookie.domain.replace(/^\./, '')}${cookie.path}`,
+        name: cookie.name,
+        storeId: cookie.storeId,
+      });
     } catch {}
   }
 
   // Uzantı storage'daki oturum verilerini temizle
-  await chrome.storage.local.remove(['igUser', 'igUserTs', 'igGqlTokens', '__analytics_log', '__automation_debug_log']);
+  await chrome.storage.local.remove([
+    'igUser',
+    'igUserTs',
+    'igGqlTokens',
+    '__analytics_log',
+    '__automation_debug_log',
+    '__cached_followers',
+    '__cached_following',
+  ]);
+  _followingCache = [];
+  _followingCacheTs = 0;
+  _followingCacheUserId = '';
   await patchState({
     enabled: false,
     todayCount: 0,
@@ -2539,16 +2689,17 @@ chrome.alarms.onAlarm.addListener(alarm => {
     });
   }
   if (alarm.name === ALARM_AUTOLIKE) {
-    chrome.cookies.get({ url: 'https://www.instagram.com', name: 'sessionid' }, cookie => {
-      if (cookie?.value) {
+    hasInstagramSessionCookie().then(present => {
+      if (present) {
         autolikeTick().catch(() => {});
         return;
       }
-      // Cookie reads can briefly return empty during navigation. A cached
-      // user still represents the active extension session.
-      chrome.storage.local.get(['igUser'], data => {
-        if (data?.igUser) autolikeTick().catch(() => {});
-      });
+      // Never use a stale igUser record as proof of a live Instagram session.
+      patchState({
+        enabled: false,
+        backoffUntil: Date.now() + 30 * 60000,
+        lastActionLabel: 'sessionid çerezi yok — otomasyon duraklatıldı',
+      }).catch(() => {});
     });
   }
 });

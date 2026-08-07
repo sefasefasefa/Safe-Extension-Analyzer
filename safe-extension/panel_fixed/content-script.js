@@ -10,6 +10,11 @@ const INSTAGRAM_GRAPHQL_DOC_ID = '26785645987802781';
 const INSTAGRAM_APP_ID = '936619743392459';
 let downloadedResponseUser = null;
 
+function isThrottleOrSessionError(error) {
+  const message = String(error?.message ?? error ?? '');
+  return /(?:\b429\b|\b401\b|\b403\b|rate[\s_-]*limit|feedback_required|login_required|oturum süresi dolmuş|oturum geçersiz)/i.test(message);
+}
+
 function csrfToken() {
   return document.cookie
     .split(';')
@@ -292,7 +297,8 @@ async function fetchFullUser() {
   if (!hasCounts) {
     try {
       user = mergeUsers(user, await requestProfileGraphQL());
-    } catch {
+    } catch (error) {
+      if (isThrottleOrSessionError(error)) return user?.pk ? user : null;
       // Continue to the lightweight REST fallbacks below.
     }
   }
@@ -301,22 +307,41 @@ async function fetchFullUser() {
     try {
       const response = await requestJson(`/api/v1/users/${user.pk}/info/`);
       user = mergeUsers(user, response?.user ?? response);
-    } catch {}
+    } catch (error) {
+      if (isThrottleOrSessionError(error)) return user?.pk ? user : null;
+    }
   }
 
   if (user?.username && (user.follower_count == null || user.following_count == null)) {
     try {
       const response = await requestJson('/api/v1/users/web_profile_info/', { username: user.username });
       user = mergeUsers(user, response?.data?.user ?? response?.user);
-    } catch {}
+    } catch (error) {
+      if (isThrottleOrSessionError(error)) return user?.pk ? user : null;
+    }
   }
 
   return user?.pk ? user : null;
 }
 
-async function publishUser() {
-  const user = await fetchFullUser();
-  if (user?.pk) chrome.runtime.sendMessage({ type: 'IG_USER_DATA', user });
+let publishInFlight = null;
+let lastPublishedAt = 0;
+
+async function publishUser(force = false) {
+  const now = Date.now();
+  if (publishInFlight) return publishInFlight;
+  if (!force && now - lastPublishedAt < 15000) return null;
+
+  lastPublishedAt = now;
+  publishInFlight = (async () => {
+    const user = await fetchFullUser();
+    if (user?.pk) chrome.runtime.sendMessage({ type: 'IG_USER_DATA', user });
+  })();
+  try {
+    return await publishInFlight;
+  } finally {
+    publishInFlight = null;
+  }
 }
 
 document.addEventListener('takipci-panel:instagram-response', (event) => {
@@ -347,7 +372,9 @@ try {
 
 setTimeout(() => publishUser().catch(() => {}), 800);
 setTimeout(() => publishUser().catch(() => {}), 5000);
-setInterval(() => publishUser().catch(() => {}), 120000);
+// Do not poll Instagram every two minutes. If page data is incomplete,
+// publishUser() can fan out into GraphQL + REST fallbacks and create a
+// needless background request stream. Refreshes are event/user driven.
 
 function clickLike(like) {
   const labels = like
@@ -374,7 +401,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
   if (message.type === 'REFRESH_USER_DATA') {
-    publishUser().catch(() => {});
+    publishUser(true).catch(() => {});
     return false;
   }
   if (message.type !== 'IG_FETCH') return false;
