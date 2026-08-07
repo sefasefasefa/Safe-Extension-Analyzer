@@ -267,60 +267,62 @@ async function requestJson(endpoint, params, method = 'GET', body) {
 }
 
 async function requestProfileGraphQL() {
-  return withContentRequestSlot(async () => {
-    const { fbDtsg, lsd } = getPageTokens();
-    if (!fbDtsg || !lsd) return null;
-    const jazoest = `2${Array.from(fbDtsg).reduce((sum, character) => sum + character.charCodeAt(0), 0)}`;
+  const { fbDtsg, lsd } = getPageTokens();
+  if (!fbDtsg || !lsd) return null;
+  const jazoest = `2${Array.from(fbDtsg).reduce((sum, character) => sum + character.charCodeAt(0), 0)}`;
 
   const call = async (userID, actorId = '0') => {
-    const body = new URLSearchParams({
-      av: actorId,
-      __d: 'www',
-      __user: '0',
-      __a: '1',
-      __req: 'g',
-      __comet_req: '7',
-      fb_dtsg: fbDtsg,
-      jazoest,
-      lsd,
-      variables: JSON.stringify({
-        userID: String(userID),
-        __relay_internal__pv__PolarisAIGMAccountLabelEnabledrelayprovider: false,
-      }),
-      doc_id: INSTAGRAM_GRAPHQL_DOC_ID,
-      server_timestamps: 'true',
-      fb_api_caller_class: 'RelayModern',
-      fb_api_req_friendly_name: 'PolarisProfilePageContentQuery',
+    return withContentRequestSlot(async () => {
+      const body = new URLSearchParams({
+        av: actorId,
+        __d: 'www',
+        __user: '0',
+        __a: '1',
+        __req: 'g',
+        __comet_req: '7',
+        fb_dtsg: fbDtsg,
+        jazoest,
+        lsd,
+        variables: JSON.stringify({
+          userID: String(userID),
+          __relay_internal__pv__PolarisAIGMAccountLabelEnabledrelayprovider: false,
+        }),
+        doc_id: INSTAGRAM_GRAPHQL_DOC_ID,
+        server_timestamps: 'true',
+        fb_api_caller_class: 'RelayModern',
+        fb_api_req_friendly_name: 'PolarisProfilePageContentQuery',
+      });
+      const response = await fetch('https://www.instagram.com/api/graphql', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          'x-asbd-id': '359341',
+          'x-csrftoken': csrfToken(),
+          'x-fb-lsd': lsd,
+          'x-ig-app-id': INSTAGRAM_APP_ID,
+          'x-fb-friendly-name': 'PolarisProfilePageContentQuery',
+          'x-ig-max-touch-points': '0',
+          'x-ig-www-claim': '0',
+        },
+        body: body.toString(),
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`GraphQL HTTP ${response.status}: ${text.slice(0, 200)}`);
+      const json = JSON.parse(text.replace(/^for\s*\(;;\);\s*/, ''));
+      if (json.errors?.length) throw new Error(JSON.stringify(json.errors).slice(0, 200));
+      return json;
     });
-    const response = await fetch('https://www.instagram.com/api/graphql', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded',
-        'x-asbd-id': '359341',
-        'x-csrftoken': csrfToken(),
-        'x-fb-lsd': lsd,
-        'x-ig-app-id': INSTAGRAM_APP_ID,
-        'x-fb-friendly-name': 'PolarisProfilePageContentQuery',
-        'x-ig-max-touch-points': '0',
-        'x-ig-www-claim': '0',
-      },
-      body: body.toString(),
-    });
-    const text = await response.text();
-    if (!response.ok) throw new Error(`GraphQL HTTP ${response.status}`);
-    return JSON.parse(text.replace(/^for\s*\(;;\);\s*/, ''));
   };
 
-    const viewerResponse = await call('1');
-    const viewer = viewerResponse?.data?.viewer?.user;
-    const userId = String(viewer?.id ?? viewer?.pk ?? cookieUserId()).trim();
-    if (!userId || userId === '0') return null;
+  const viewerResponse = await call('1');
+  const viewer = viewerResponse?.data?.viewer?.user;
+  const userId = String(viewer?.id ?? viewer?.pk ?? cookieUserId()).trim();
+  if (!userId || userId === '0') return null;
 
-    const profileResponse = await call(userId, userId);
-    const userDict = profileResponse?.data?.xig_user_by_igid_v2?.user_dict;
-    return mergeUsers(userDict, profileResponse?.data?.user, viewer, { pk: userId });
-  });
+  const profileResponse = await call(userId, userId);
+  const userDict = profileResponse?.data?.xig_user_by_igid_v2?.user_dict;
+  return mergeUsers(userDict, profileResponse?.data?.user, viewer, { pk: userId });
 }
 
 async function fetchFullUser() {

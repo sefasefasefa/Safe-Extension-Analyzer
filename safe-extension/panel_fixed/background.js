@@ -23,16 +23,26 @@ const LIKED_CAP       = 5000; // son 5000 benzer ID'yi "zaten beğenilmiş" say
 // This is a safety control, not an attempt to bypass Instagram enforcement.
 const IG_REQUEST_MIN_GAP_MS = 1500;
 const IG_RATE_LIMIT_BLOCK_KEY = 'igRateLimitBlockedUntil';
+const IG_SESSION_PROBE_KEY = 'igSessionProbeAt';
+const IG_SESSION_PROBE_MIN_GAP_MS = 60 * 1000;
 let _igRequestQueue = Promise.resolve();
 let _lastIgRequestStartedAt = 0;
 let _igRequestBlockedUntil = 0;
+let _domStoryLikeInFlight = false;
+let _sessionProbeInFlight = false;
 
-chrome.storage.local.get([IG_RATE_LIMIT_BLOCK_KEY], stored => {
-  _igRequestBlockedUntil = Number(stored?.[IG_RATE_LIMIT_BLOCK_KEY]) || 0;
+const _igRequestBlockReady = new Promise(resolve => {
+  chrome.storage.local.get([IG_RATE_LIMIT_BLOCK_KEY], stored => {
+    _igRequestBlockedUntil = Number(stored?.[IG_RATE_LIMIT_BLOCK_KEY]) || 0;
+    resolve();
+  });
 });
 
 function withInstagramRequestSlot(operation, task) {
   const run = _igRequestQueue.then(async () => {
+    // Service workers can receive a message before the async storage read above
+    // has completed. Do not let that race bypass a persisted cooldown.
+    await _igRequestBlockReady;
     if (_igRequestBlockedUntil > Date.now()) {
       const waitMinutes = Math.ceil((_igRequestBlockedUntil - Date.now()) / 60000);
       throw new Error(`Instagram rate-limit cooldown aktif — ${waitMinutes} dk daha bekleniyor (429)`);
@@ -66,7 +76,22 @@ function isRateLimitMessage(error) {
 
 function isSessionError(error) {
   const message = String(error?.message ?? error ?? '');
-  return /(?:\b401\b|\b403\b|login_required|session(?:id)?[_\s-]*(?:expired|invalid|required)|oturum süresi dolmuş|oturum geçersiz)/i.test(message);
+  // A bare 403 is also used for anti-abuse/access restrictions. Treating every
+  // 403 as a logout causes needless login prompts and repeated auth attempts.
+  return /(?:\b401\b|login_required|session(?:id)?[_\s-]*(?:expired|invalid|required)|oturum süresi dolmuş|oturum geçersiz)/i.test(message);
+}
+
+function isAccessBlockedMessage(error) {
+  const message = String(error?.message ?? error ?? '');
+  return /(?:\b403\b|forbidden|checkpoint[_\s]required|challenge[_\s]required|feedback_required)/i.test(message);
+}
+
+function isAutomationStopError(error) {
+  return isRateLimitMessage(error) ||
+    isSessionError(error) ||
+    isAccessBlockedMessage(error) ||
+    isInstagramCheckpointError(error) ||
+    isTransientTabIssue(error);
 }
 
 async function hasInstagramSessionCookie() {
@@ -597,6 +622,7 @@ async function likeMediaWithGraphQL(mediaId, type) {
     const restMsg = restError?.message ?? '';
     if (isRateLimitMessage(restError) ||
         isSessionError(restError) ||
+        isAccessBlockedMessage(restError) ||
         isTransientTabIssue(restError)) {
       throw restError;
     }
@@ -947,7 +973,7 @@ async function getFollowing(userId) {
     }
     lastError = new Error('Content-script isteği 0 kullanıcı döndürdü');
   } catch (err) {
-    if (isRateLimitMessage(err) || isSessionError(err) || isTransientTabIssue(err)) throw err;
+    if (isAutomationStopError(err)) throw err;
     lastError = err;
     await appendDebugLog('warn', `getFollowing CS hata: ${String(err.message ?? err).slice(0, 200)}`);
   }
@@ -991,7 +1017,7 @@ async function getFollowing(userId) {
     }
     lastError = null;
   } catch (error) {
-    if (isRateLimitMessage(error)) throw error;
+    if (isAutomationStopError(error)) throw error;
     lastError = error;
     await appendDebugLog('error', `getFollowing exec hata: ${String(error.message ?? error).slice(0, 300)}`);
   }
@@ -1235,7 +1261,12 @@ async function apiCallUnqueued(endpoint, params, method = 'GET', body) {
     // Never retry a server-enforced limit or an authentication/challenge
     // response. Retrying these responses only increases pressure on the
     // account and can turn a temporary restriction into a longer one.
-    if (isRateLimitMessage(e) || isSessionError(e) || isInstagramCheckpointError(e)) {
+    if (
+      isRateLimitMessage(e) ||
+      isSessionError(e) ||
+      isAccessBlockedMessage(e) ||
+      isInstagramCheckpointError(e)
+    ) {
       throw e;
     }
     if (isTabError(e)) {
@@ -1255,29 +1286,28 @@ async function apiCallUnqueued(endpoint, params, method = 'GET', body) {
         }
       }
 
-      // Yanıt boş: sekme yönlenme/challenge sırasında null döndü.
-      // Önce AYNI sekmede dene (kısa navigasyonlar genellikle 1-2 sn içinde çözülür).
+      // Sekme kapanması/geçişi gibi istemci tarafı bir hata için yalnızca
+      // bir kez, aynı sekmede ve aralık bırakarak dene. Yeni sekme açıp aynı
+      // endpoint'i tekrar vurmak Instagram tarafında gereksiz trafik üretir.
       await new Promise(r => setTimeout(r, 2000));
       try {
         const data = await execRestInTab(tabId, url, method, body ?? null);
         await appendDebugLog('info', 'execRestInTab başarılı (retry-same)', { endpoint, method });
         return data;
       } catch (sameTabError) {
-        // Aynı sekme hâlâ sorunlu — yeni bir sekme dene.
-        try {
-          tabId = await getInstagramTab();
-          const data = await execRestInTab(tabId, url, method, body ?? null);
-          await appendDebugLog('info', 'execRestInTab başarılı (retry-newtab)', { endpoint, method });
-          return data;
-        } catch (newTabError) {
-          // Tüm denemeler başarısız; yalnızca gerçek hataları logla.
-          // Geçici HTML yönlendirmesi üst katman tarafından tek seferlik loglanır.
-          const isStillEmpty = isTransientTabIssue(newTabError);
-          if (!isStillEmpty) {
-            await appendDebugLog('error', newTabError.message || newTabError, { endpoint, method, retry: true });
-          }
-          throw newTabError;
+        if (
+          isRateLimitMessage(sameTabError) ||
+          isSessionError(sameTabError) ||
+          isAccessBlockedMessage(sameTabError) ||
+          isInstagramCheckpointError(sameTabError)
+        ) {
+          throw sameTabError;
         }
+        const isStillEmpty = isTransientTabIssue(sameTabError);
+        if (!isStillEmpty) {
+          await appendDebugLog('error', sameTabError.message || sameTabError, { endpoint, method, retry: true });
+        }
+        throw sameTabError;
       }
     }
     await appendDebugLog('error', e.message || e, { endpoint, method });
@@ -1400,6 +1430,10 @@ async function getUserViaGraphQL(tabId) {
       const jazoest = '2' + String(Array.from(fbDtsg).reduce((a, c) => a + c.charCodeAt(0), 0));
 
       const doGql = async (docId, variables, actorId = '0', friendlyName = '') => {
+        // A single profile refresh can require two GraphQL calls. Keep the
+        // same conservative spacing inside this executeScript as well as
+        // between separate extension messages.
+        await new Promise(resolve => setTimeout(resolve, 1500));
         const body = new URLSearchParams({
           av: actorId, __d: 'www', __user: '0', __a: '1', __req: 'g',
           __comet_req: '7', __spin_b: 'trunk', __spin_r: '1043716065', __spin_t: '0',
@@ -1627,22 +1661,42 @@ async function runAutolikeTick() {
   try {
     following = await getFollowing(userId);
   } catch (error) {
-    if (isRateLimitMessage(error)) {
+    if (isAutomationStopError(error)) {
       const errCount = state.consecutiveErrors + 1;
-      const backoffMs = Math.min(
-        30 * 60000 * (2 ** Math.max(0, errCount - 1)),
-        6 * 60 * 60000,
-      );
+      const isSessionExpired = isSessionError(error);
+      const isChallenge = isInstagramCheckpointError(error);
+      const isAccessBlocked = isAccessBlockedMessage(error);
+      const isTransient = isTransientTabIssue(error);
+      const backoffMs = isSessionExpired
+        ? 30 * 60000
+        : isChallenge || isAccessBlocked
+        ? 60 * 60000
+        : isTransient
+        ? 30 * 60000
+        : Math.min(
+            30 * 60000 * (2 ** Math.max(0, errCount - 1)),
+            6 * 60 * 60000,
+          );
       const backoffMinutes = Math.max(1, Math.ceil(backoffMs / 60000));
       await patchState({
         consecutiveErrors: errCount,
         backoffUntil: now + backoffMs,
         nextRunAt: now + backoffMs,
-        lastActionLabel: `Instagram istek sınırı uyguladı — otomasyon duraklatıldı, ${backoffMinutes} dk boyunca yeni istek gönderilmeyecek`,
+        enabled: true,
+        lastActionLabel: isSessionExpired
+          ? 'Oturum geçersiz — yeniden giriş yapana kadar otomasyon duraklatıldı'
+          : isChallenge || isAccessBlocked
+          ? `Instagram erişimi/doğrulaması kısıtlandı — otomasyon ${backoffMinutes} dk duraklatıldı`
+          : isTransient
+          ? 'Instagram sekmesi geçici olarak hazır değil — otomasyon 30 dk duraklatıldı'
+          : `Instagram istek sınırı uyguladı — otomasyon duraklatıldı, ${backoffMinutes} dk boyunca yeni istek gönderilmeyecek`,
       });
       await appendDebugLog('warn', error.message || error, {
         phase: 'following',
-        rateLimit: true,
+        rateLimit: isRateLimitMessage(error),
+        sessionExpired: isSessionExpired,
+        challenge: isChallenge,
+        accessBlocked: isAccessBlocked,
         consecutiveErrors: errCount,
         backoffMinutes,
       });
@@ -1997,6 +2051,7 @@ async function runAutolikeTick() {
     // ve genellikle instagram.com/challenge/ adresinde görünür ekranla birlikte gelir.
     const isDocIdError = /\b1357004\b/.test(msg);
     const isChallenge = !isDocIdError && (isInstagramCheckpointError(msg) || /captcha|recaptcha/i.test(msg));
+    const isAccessBlocked = isAccessBlockedMessage(msg);
     const isEmptyResponse = isTransientTabIssue(msg);
     // Oturumun kesin olarak süresi dolduğu doğrulandıysa (yönlendirme takibiyle
     // tespit edildi), her dakika aynı isteği tekrar tekrar deneyip aynı hatayı
@@ -2030,7 +2085,7 @@ async function runAutolikeTick() {
     let backoffMs;
     if (isSessionExpired) {
       backoffMs = 30 * 60000;
-    } else if (isChallenge) {
+    } else if (isChallenge || isAccessBlocked) {
       backoffMs = 60 * 60000;  // 1 saat — kullanıcı tarayıcıda challenge'ı çözsün
     } else if (isDocIdError) {
       backoffMs = 5 * 60000;   // 5 dk — geçici, doc_id hatası gerçek engel değil
@@ -2042,8 +2097,8 @@ async function runAutolikeTick() {
     const backoffMinutes = Math.max(1, Math.ceil(backoffMs / 60000));
     const statusLabel = isSessionExpired
       ? 'Oturum süresi dolmuş — instagram.com\'a tarayıcıdan yeniden giriş yapıp otomasyonu tekrar aç'
-      : isChallenge
-      ? 'Instagram doğrulama istedi (reCAPTCHA/checkpoint) — instagram.com sekmesinde doğrulamayı tamamla, otomasyon 60 dk sonra yeniden deneyecek'
+      : isChallenge || isAccessBlocked
+      ? 'Instagram erişimi/doğrulaması kısıtlandı — instagram.com sekmesini kontrol et; otomasyon 60 dk duraklatıldı'
       : isDocIdError
       ? `Hikaye beğeni isteği reddedildi (geçici API sorunu) — ${backoffMinutes} dk sonra yeniden denecek`
       : isRateLimit
@@ -2055,15 +2110,16 @@ async function runAutolikeTick() {
       backoffUntil: now + backoffMs,
       nextRunAt: now + backoffMs,
       lastActionLabel: statusLabel,
-      ...((isSessionExpired || isRateLimit || isChallenge)
+      ...((isSessionExpired || isRateLimit || isChallenge || isAccessBlocked)
         ? { enabled: false }
         : {}),
     });
-    await appendDebugLog(isRateLimit || isChallenge || isEmptyResponse || isSessionExpired ? 'warn' : 'error', msg, {
+    await appendDebugLog(isRateLimit || isChallenge || isAccessBlocked || isEmptyResponse || isSessionExpired ? 'warn' : 'error', msg, {
       phase: 'autolikeTick',
       consecutiveErrors: errCount,
       rateLimit: isRateLimit,
       challenge: isChallenge,
+      accessBlocked: isAccessBlocked,
       sessionExpired: isSessionExpired,
       backoffMinutes,
     });
@@ -2213,22 +2269,31 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   }
 
   if (msg.type === 'DOM_LIKE_STORY') {
+    if (_domStoryLikeInFlight) {
+      reply({ ok: false, error: 'Hikaye işlemi zaten devam ediyor — ikinci istek gönderilmedi' });
+      return false;
+    }
     chrome.tabs.query({ url: '*://*.instagram.com/*' }, tabs => {
-      const igTabs = tabs.filter(t => t.id != null);
-      if (igTabs.length === 0) { reply({ ok: false, error: 'Açık Instagram sekmesi bulunamadı' }); return; }
-      let done = false;
-      let remaining = igTabs.length;
-      for (const tab of igTabs) {
-        chrome.tabs.sendMessage(tab.id, { type: 'DOM_LIKE_STORY', like: msg.like }, res => {
-          remaining--;
-          if (chrome.runtime.lastError || !res) {
-            if (!done && remaining === 0) reply({ ok: false, error: 'Content script yanıt vermedi' });
-            return;
-          }
-          if (!done && res.ok) { done = true; reply({ ok: true }); }
-          else if (!done && remaining === 0) reply({ ok: false, error: "Hikaye butonu DOM'da bulunamadı" });
-        });
+      const tab = tabs.find(t =>
+        t.id != null &&
+        t.status === 'complete' &&
+        !t.url?.includes('/accounts/')
+      ) ?? tabs.find(t => t.id != null && t.status === 'complete');
+      if (!tab?.id) {
+        reply({ ok: false, error: 'Açık Instagram sekmesi bulunamadı' });
+        return;
       }
+      _domStoryLikeInFlight = true;
+      chrome.tabs.sendMessage(tab.id, { type: 'DOM_LIKE_STORY', like: msg.like }, res => {
+        _domStoryLikeInFlight = false;
+        if (chrome.runtime.lastError || !res) {
+          reply({ ok: false, error: 'Content script yanıt vermedi' });
+          return;
+        }
+        reply(res.ok
+          ? { ok: true }
+          : { ok: false, error: "Hikaye butonu DOM'da bulunamadı" });
+      });
     });
     return true;
   }
@@ -2239,11 +2304,42 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   }
 
   if (msg.type === 'IG_SESSION_PROBE') {
+    if (_sessionProbeInFlight) {
+      reply({ ok: false, reason: 'probe-in-flight', message: 'Oturum kontrolü zaten devam ediyor' });
+      return false;
+    }
+    _sessionProbeInFlight = true;
+    chrome.storage.local.get([IG_SESSION_PROBE_KEY], stored => {
+      const lastProbeAt = Number(stored?.[IG_SESSION_PROBE_KEY]) || 0;
+      const elapsed = Date.now() - lastProbeAt;
+      if (elapsed < IG_SESSION_PROBE_MIN_GAP_MS) {
+        _sessionProbeInFlight = false;
+        reply({
+          ok: false,
+          reason: 'probe-cooldown',
+          message: `Oturum kontrolü için ${Math.ceil((IG_SESSION_PROBE_MIN_GAP_MS - elapsed) / 1000)} sn bekleyin`,
+        });
+        return;
+      }
+      chrome.storage.local.set({ [IG_SESSION_PROBE_KEY]: Date.now() }, () => {
+        void chrome.runtime.lastError;
+        withInstagramRequestSlot(
+          'session-probe',
+          () => runSessionProbe(reply),
+        ).catch(error => {
+          reply({ ok: false, error: error.message || String(error) });
+        }).finally(() => { _sessionProbeInFlight = false; });
+      });
+    });
+    return true;
+  }
+
+  async function runSessionProbe(reply) {
     // Canlı oturum probe'u — SADECE açık bir instagram.com sekmesi varsa
     // o sekmenin içinden çalışır. Çerezler orada otomatik, istek normal
     // sayfa içi XHR gibi görünür → Instagram rate-limit/reCAPTCHA tetiklemez.
     // Yoksa kendi başına fetch atmaz, kullanıcının sekme açmasını ister.
-    chrome.tabs.query({ url: '*://*.instagram.com/*' }, (tabs) => {
+    await new Promise(resolve => chrome.tabs.query({ url: '*://*.instagram.com/*' }, (tabs) => {
       const usable = tabs.find(t => t.id != null && t.status === 'complete' && !t.url?.includes('/accounts/'))
                   ?? tabs.find(t => t.id != null && t.status === 'complete')
                   ?? tabs.find(t => t.id != null);
@@ -2259,6 +2355,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
           sessionCheckedAt: Date.now(),
         }).catch(() => {});
         broadcastStatus();
+        resolve();
         return;
       }
       // IG sekmesinin içinden gerçek bir fetch — cookie'ler otomatik
@@ -2298,6 +2395,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
         const r = results?.[0]?.result;
         if (!r?.ok) throw new Error(r?.error || 'sekme içi probe başarısız');
         const lower = (r.body || '').toLowerCase();
+        const probeRateLimited = r.status === 429 || lower.includes('feedback_required');
+        if (probeRateLimited) {
+          _igRequestBlockedUntil = Math.max(_igRequestBlockedUntil, Date.now() + 30 * 60000);
+          chrome.storage.local.set({ [IG_RATE_LIMIT_BLOCK_KEY]: _igRequestBlockedUntil });
+        }
         // Content-type html TEK BAŞINA yeterli değil — Instagram anti-bot olarak
         // JSON endpoint'e HTML dönebiliyor. Gerçek login yönlendirmesi için
         // body'de login/logout spesifik anahtar kelimeler de olmalı.
@@ -2345,12 +2447,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
             const merged = { ...(igUser ?? {}), username, pk: userId || igUser?.pk };
             chrome.storage.local.set({ igUser: merged, igUserTs: Date.now() });
           });
-        } else if (!valid && isRealLoginRedirect) {
+        } else if (!valid && (isRealLoginRedirect || probeRateLimited)) {
           // Gerçek login yönlendirmesi → otomasyonu duraklat
           patchState({
-            backoffUntil: Date.now() + 30 * 60000,
+            backoffUntil: Date.now() + (probeRateLimited ? 30 : 60) * 60000,
             enabled: false,
-            lastActionLabel: 'Oturum geçersizleşti — instagram.com\'a tarayıcıdan giriş yap ve otomasyonu tekrar aç',
+            lastActionLabel: probeRateLimited
+              ? 'Instagram istek sınırı uyguladı — otomasyon 30 dk duraklatıldı'
+              : 'Oturum geçersizleşti — instagram.com\'a tarayıcıdan giriş yap ve otomasyonu tekrar aç',
           }).catch(() => {});
         }
         // valid=false ama isRealLoginRedirect=false → geçici API sorunu, extension'ı kapatma
@@ -2367,9 +2471,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
           tabUrl: r.url,
           checkedAt: Date.now(),
         }));
-      }).catch(e => reply({ ok: false, error: e.message || String(e) }));
-    });
-    return true;
+      }).catch(e => reply({ ok: false, error: e.message || String(e) }))
+        .finally(resolve);
+    }));
   }
 
   if (msg.type === 'IG_AUTO_SET') {
