@@ -101,13 +101,21 @@
     }
   }
 
-  /* ── DOM hazır olduğunda ve React nav'ı eklediğinde tek observer ── */
-  function _watchNav() {
+  /* ── Polling: nav DOM'a eklenene kadar bekle ─────────── */
+  var _attempts = 0;
+  var _timer = setInterval(function () {
     var nav = document.querySelector('nav');
-    if (nav) _inject(nav);
-  }
+    if (nav) {
+      clearInterval(_timer);
+      _inject(nav);
 
-  _watchNav();
-  var _observer = new MutationObserver(_watchNav);
-  _observer.observe(document.documentElement, { childList: true, subtree: true });
+      /* React re-render'ında butonu kaybetmemek için observer */
+      var obs = new MutationObserver(function () {
+        _inject(nav);
+      });
+      obs.observe(nav, { childList: true });
+    } else if (++_attempts > 300) {   /* 15 sn sonra vazgeç */
+      clearInterval(_timer);
+    }
+  }, 50);
 })();

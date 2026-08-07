@@ -12,51 +12,13 @@ self.addEventListener('error', event => {
 });
 
 // ── Sabitler ─────────────────────────────────────────────────────────
+const ALARM_AUTOLIKE  = 'ig-autolike';
+const ALARM_KEEPALIVE = 'ig-keepalive';
 const STATE_KEY       = 'igAutoState';
 const LOG_KEY         = '__analytics_log';
 const DEBUG_LOG_KEY   = '__automation_debug_log';
 const LIKED_KEY       = '__liked_media_ids';
 const LIKED_CAP       = 5000; // son 5000 benzer ID'yi "zaten beğenilmiş" say
-const REQUEST_CACHE_TTL_MS = 15_000;
-const SAFE_AUTO_LIMITS = Object.freeze({
-  minDelaySec: [300, 3600],
-  maxDelaySec: [300, 3600],
-  maxPerDay: [1, 10],
-  maxPerHour: [1, 3],
-  batchSize: [1, 1],
-  batchPauseSec: [1800, 7200],
-});
-const requestInFlight = new Map();
-const requestCache = new Map();
-let autolikeInFlight = null;
-
-function requestKey(endpoint, params, method = 'GET', body) {
-  return JSON.stringify([
-    method,
-    endpoint,
-    params ?? null,
-    body ?? null,
-  ]);
-}
-
-async function runOncePerKey(key, operation, cacheTtl = 0) {
-  const now = Date.now();
-  const cached = cacheTtl > 0 ? requestCache.get(key) : null;
-  if (cached && cached.expiresAt > now) return cached.value;
-  if (requestInFlight.has(key)) return requestInFlight.get(key);
-
-  const pending = Promise.resolve().then(operation);
-  requestInFlight.set(key, pending);
-  try {
-    const value = await pending;
-    if (cacheTtl > 0) {
-      requestCache.set(key, { value, expiresAt: Date.now() + cacheTtl });
-    }
-    return value;
-  } finally {
-    requestInFlight.delete(key);
-  }
-}
 
 function isRateLimitMessage(error) {
   const message = String(error?.message ?? error ?? '');
@@ -124,10 +86,10 @@ const DEFAULT_STATE = {
   enabled: false,
   timeFrom: 0,
   timeTo: 24,
-  minDelaySec: 300,
-  maxDelaySec: 900,
-  maxPerDay: 10,
-  maxPerHour: 3,            // saatlik güvenlik sınırı
+  minDelaySec: 65,
+  maxDelaySec: 200,
+  maxPerDay: 50,
+  maxPerHour: 35,           // saatlik güvenlik sınırı
   targetType: 'reels',
   todayCount: 0,
   todayDate: '',
@@ -137,8 +99,8 @@ const DEFAULT_STATE = {
   backoffUntil: 0,
   consecutiveErrors: 0,
   lastActionLabel: '',
-  batchSize: 1,             // her işlem ayrı bir güvenlik aralığı kullanır
-  batchPauseSec: 1800,      // ardışık işlemler arasında en az 30 dk
+  batchSize: 5,             // otomatik — her 5 beğenide 1 mola (kod belirler)
+  batchPauseSec: 300,       // otomatik — 5 dk bekleme (kod belirler)
   enabledContentTypes: ['story', 'post', 'reel'], // kullanıcı seçer
   sessionValid: false,
   sessionReason: '',
@@ -146,35 +108,6 @@ const DEFAULT_STATE = {
   sessionUserId: '',
   sessionCheckedAt: 0,
 };
-
-function clampNumber(value, [min, max], fallback) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return Math.min(max, Math.max(min, Math.round(number)));
-}
-
-function normalizeAutomationState(input) {
-  const state = { ...DEFAULT_STATE, ...(input ?? {}) };
-  state.timeFrom = 0;
-  state.timeTo = 24;
-  state.minDelaySec = clampNumber(state.minDelaySec, SAFE_AUTO_LIMITS.minDelaySec, DEFAULT_STATE.minDelaySec);
-  state.maxDelaySec = clampNumber(state.maxDelaySec, SAFE_AUTO_LIMITS.maxDelaySec, DEFAULT_STATE.maxDelaySec);
-  state.maxDelaySec = Math.max(state.maxDelaySec, state.minDelaySec);
-  state.maxPerDay = clampNumber(state.maxPerDay, SAFE_AUTO_LIMITS.maxPerDay, DEFAULT_STATE.maxPerDay);
-  state.maxPerHour = clampNumber(state.maxPerHour, SAFE_AUTO_LIMITS.maxPerHour, DEFAULT_STATE.maxPerHour);
-  state.batchSize = clampNumber(state.batchSize, SAFE_AUTO_LIMITS.batchSize, DEFAULT_STATE.batchSize);
-  state.batchPauseSec = clampNumber(state.batchPauseSec, SAFE_AUTO_LIMITS.batchPauseSec, DEFAULT_STATE.batchPauseSec);
-  state.targetType = ['reels', 'posts', 'stories', 'all'].includes(state.targetType)
-    ? state.targetType
-    : DEFAULT_STATE.targetType;
-  state.enabledContentTypes = Array.isArray(state.enabledContentTypes)
-    ? [...new Set(state.enabledContentTypes.filter(type => ['story', 'post', 'reel'].includes(type)))]
-    : [...DEFAULT_STATE.enabledContentTypes];
-  if (state.enabledContentTypes.length === 0) {
-    state.enabledContentTypes = [...DEFAULT_STATE.enabledContentTypes];
-  }
-  return state;
-}
 
 // ── "Zaten beğenilmiş" medya ID'leri (tekrar beğenmemek için) ─────────
 // Instagram'ın "PolarisProfileLikeListQuery" döndüğü zaman bile nadiren
@@ -254,7 +187,11 @@ loadLikedCache().catch(() => {});
 function getState() {
   return new Promise(resolve =>
     chrome.storage.local.get([STATE_KEY], data => {
-      const state = normalizeAutomationState(data[STATE_KEY]);
+      const saved = data[STATE_KEY] ?? {};
+      const state = { ...DEFAULT_STATE, ...saved };
+      // Unconditionally enforce 24/7 — automation never has a time window.
+      state.timeFrom = 0;
+      state.timeTo = 24;
       // Clear any stale schedule-related label from older builds.
       if (state.lastActionLabel && (
         state.lastActionLabel.includes('izin verilen saatler') ||
@@ -272,9 +209,8 @@ function getState() {
 function patchState(patch) {
   return new Promise(resolve =>
     chrome.storage.local.get([STATE_KEY], data => {
-      const current = normalizeAutomationState(data[STATE_KEY]);
-      const next = normalizeAutomationState({ ...current, ...(patch ?? {}) });
-      chrome.storage.local.set({ [STATE_KEY]: next }, resolve);
+      const current = { ...DEFAULT_STATE, ...(data[STATE_KEY] ?? {}) };
+      chrome.storage.local.set({ [STATE_KEY]: { ...current, ...patch } }, resolve);
     })
   );
 }
@@ -346,6 +282,11 @@ async function appendDebugLog(level, message, context = {}) {
   }
 }
 
+function isPortClosedError(error) {
+  const msg = String(error?.message ?? error ?? '');
+  return msg.includes('message port') || msg.includes('Receiving end') || msg.includes('No tab with id');
+}
+
 async function runGraphQLMutation(docId, variables, friendlyName) {
   const storage = await new Promise(resolve =>
     chrome.storage.local.get(['igUser', 'igGqlTokens'], resolve)
@@ -354,8 +295,10 @@ async function runGraphQLMutation(docId, variables, friendlyName) {
   const igGqlTokens = storage.igGqlTokens;
   const userId      = String(igUser?.pk ?? igUser?.fbid_v2 ?? '');
 
-  const tabId = await getInstagramTab();
-  try {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tabId = await getInstagramTab();
+    try {
       const results = await chrome.scripting.executeScript({
         target: { tabId },
         func: async (docId, variablesStr, friendlyNameArg, actorId, fbDtsg, lsd, csrf) => {
@@ -426,12 +369,21 @@ async function runGraphQLMutation(docId, variables, friendlyName) {
         throw new Error(errMsg);
       }
       return res.data;
-  } catch (error) {
-    throw error;
+    } catch (error) {
+      lastError = error;
+      if (isPortClosedError(error) && attempt === 0) {
+        await appendDebugLog('warn', 'GraphQL executeScript bağlantı hatası, yeniden deneniyor', {
+          docId, friendlyName, error: error.message,
+        });
+        continue;
+      }
+      throw error;
+    }
   }
+  throw lastError;
 }
 
-async function callGraphQLMutationUncached(docId, variables, friendlyName) {
+async function callGraphQLMutation(docId, variables, friendlyName) {
   try {
     const data = await runGraphQLMutation(docId, variables, friendlyName);
     if (!data || typeof data !== 'object') throw new Error('GraphQL veri gövdesi boş');
@@ -451,15 +403,6 @@ async function callGraphQLMutationUncached(docId, variables, friendlyName) {
   }
 }
 
-async function callGraphQLMutation(docId, variables, friendlyName) {
-  const key = `graphql:${requestKey(friendlyName, variables, 'POST')}`;
-  return runOncePerKey(
-    key,
-    () => callGraphQLMutationUncached(docId, variables, friendlyName),
-    REQUEST_CACHE_TTL_MS,
-  );
-}
-
 // ── REST v1 beğeni (doc_id bağımsız, daha kararlı) ───────────────────
 // Instagram'ın GraphQL beğeni mutasyonları sabit (hardcoded) doc_id değerlerine
 // bağlıdır. Instagram web uygulamasını güncellediğinde bu ID'ler değişir ve
@@ -468,9 +411,11 @@ async function callGraphQLMutation(docId, variables, friendlyName) {
 // çünkü bu bir challenge değil, "bilinmeyen sorgu" reddidir.
 // Mobil uygulamaların kullandığı REST v1 endpoint'i doc_id gerektirmez ve
 // bu yüzden çok daha kararlıdır.
-async function likeMediaWithRESTInternal(mediaId) {
-  const tabId = await getInstagramTab();
-  try {
+async function likeMediaWithREST(mediaId) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tabId = await getInstagramTab();
+    try {
       const results = await chrome.scripting.executeScript({
         target: { tabId },
         func: async (mediaId) => {
@@ -530,23 +475,22 @@ async function likeMediaWithRESTInternal(mediaId) {
       if (!res) throw new Error('Yanıt boş');
       if (!res.ok) throw new Error(res.error ?? `REST beğeni başarısız (${res.status})`);
       return true;
-  } catch (error) {
-    throw error;
+    } catch (error) {
+      lastError = error;
+      if (isPortClosedError(error) && attempt === 0) {
+        await appendDebugLog('warn', 'REST beğeni bağlantı hatası, yeniden deneniyor', { mediaId, error: error.message });
+        continue;
+      }
+      throw error;
+    }
   }
-}
-
-async function likeMediaWithREST(mediaId) {
-  return runOncePerKey(
-    `like:${String(mediaId)}`,
-    () => likeMediaWithRESTInternal(mediaId),
-    5 * 60_000,
-  );
+  throw lastError;
 }
 
 async function likeMediaWithGraphQL(mediaId, type) {
-  // Tüm içerik türleri için yalnızca REST v1 kullan.
-  // Başarısız bir mutasyonu ikinci bir ağ isteğiyle tekrarlama; ilk isteğin
-  // sunucuda işlenip yanıtın kaybolduğu belirsiz durumda çift beğeniyi önler.
+  // Tüm içerik türleri için önce REST v1 dene (doc_id bağımsız).
+  // REST başarısız olursa hikayeler için GraphQL fallback'e düş,
+  // gönderi/reel için GraphQL'e DÜŞME (doc_id bozuk, sahte challenge üretir).
   try {
     await likeMediaWithREST(mediaId);
     await appendDebugLog('info', `${type} beğeni REST ile başarılı`, { mediaId: String(mediaId) });
@@ -554,11 +498,85 @@ async function likeMediaWithGraphQL(mediaId, type) {
   } catch (restError) {
     const restMsg = restError?.message ?? '';
     if (isRateLimitMessage(restError)) throw restError;
-    await appendDebugLog('warn', `${type} beğeni REST başarısız — ikinci istek gönderilmedi`, {
-      mediaId: String(mediaId), type, error: restMsg,
+    // REST'ten gelen gerçek checkpoint/challenge → fırlat
+    if (isInstagramCheckpointError(restError) && !restMsg.includes('1357004')) throw restError;
+    // Gönderi/Reel: GraphQL'e düşme, REST hatayı dışarı ver
+    if (type !== 'story') {
+      await appendDebugLog('warn', `${type} beğeni REST başarısız — atlandı`, {
+        mediaId: String(mediaId), type, error: restMsg,
+      });
+      throw restError;
+    }
+    // Hikaye: GraphQL fallback'e devam et
+    await appendDebugLog('warn', `story beğeni REST başarısız, GraphQL deneniyor`, {
+      mediaId: String(mediaId), error: restMsg,
     });
-    throw restError;
   }
+
+  // ── Hikaye GraphQL fallback ───────────────────────────────────────────
+  // 1357004 buradan gelirse: eski doc_id reddi, gerçek challenge DEĞİL.
+  // autolikeTick'e "docIdError" olarak işaretle ki 60 dk backoff uygulanmasın.
+  const story = true;
+  const docId = '26938887309082050';
+  const friendlyName = story
+    ? 'usePolarisStoriesV4LikeMutationLikeMutation'
+    : 'usePolarisFeedLikeMutationLikeMutation';
+  const variables = {
+    input: {
+      actor_id: '__actor_id__',
+      client_mutation_id: String(Date.now()),
+      media_id: String(mediaId),
+    },
+  };
+  const data = await callGraphQLMutation(docId, variables, friendlyName);
+  const serialized = JSON.stringify(data);
+  if (/"errors"\s*:|\"error\"\s*:/i.test(serialized)) {
+    throw new Error(`${type} beğeni GraphQL hata yanıtı: ${serialized.slice(0, 300)}`);
+  }
+  // Verify the like was actually registered by checking the mutation result.
+  // Instagram response shape: { data: { [mutationName]: { media: { has_liked, id } } } }
+  const dataEntries = data?.data ? Object.entries(data.data) : [];
+  const mutationResult = dataEntries.find(([k, v]) => v && typeof v === 'object')?.[1] || null;
+  const mediaResult = mutationResult?.media || mutationResult;
+  // Instagram often returns has_liked: null or a payload that only carries a
+  // __typename such as XIGSendStoryLikeResponsePayload. Accept any mutation
+  // result object that has no errors and carries at least one success indicator
+  // (has_liked, liked, status, client_mutation_id, a like-related __typename, or a
+  // media object with an id — Instagram post/reel mutations sometimes return
+  // has_liked:false even when the like was successfully registered; the presence
+  // of a media.id with no errors is the reliable success signal).
+  const hasMutationErrors = dataEntries.some(([k, v]) => v && typeof v === 'object' && Array.isArray(v.errors) && v.errors.length > 0);
+  const payloadTypename = mutationResult?.__typename;
+  const isSuccessTypename = payloadTypename && /like|sendstory/i.test(payloadTypename);
+  const liked = !hasMutationErrors && (
+    mediaResult?.has_liked === true ||
+    mediaResult?.has_liked === null ||
+    mediaResult?.id != null ||
+    mutationResult?.liked === true ||
+    mutationResult?.status === 'ok' ||
+    typeof mutationResult?.client_mutation_id === 'string' ||
+    typeof mutationResult?.client_mutation_id === 'number' ||
+    isSuccessTypename
+  );
+  if (!liked) {
+    const snippet = JSON.stringify(mutationResult).slice(0, 250);
+    await appendDebugLog('error', `${type} beğeni mutation başarısız (onaylanmadı)`, {
+      operation: friendlyName, mediaId: String(mediaId), response: snippet,
+    });
+    throw new Error(`${type} beğeni onaylanmadı: ${snippet}`);
+  }
+  // Keep the raw response in debug storage so a changed Instagram payload
+  // can be diagnosed without losing the count.
+  await appendDebugLog('info', `${type} beğeni mutation başarılı - onaylandı`, {
+    operation: friendlyName,
+    docId,
+    mediaId: String(mediaId),
+    responseKeys: Object.keys(data),
+    mutationResultKeys: mutationResult ? Object.keys(mutationResult) : [],
+    typename: payloadTypename,
+    has_liked: mediaResult?.has_liked,
+  });
+  return data;
 }
 
 // ── Tarih / saat yardımcıları ─────────────────────────────────────────
@@ -692,7 +710,6 @@ function focusTabSafely(tab) {
 // ── Takip listesi önbelleği (4 saat) ─────────────────────────────────
 let _followingCache = [];
 let _followingCacheTs = 0;
-let followingInFlight = null;
 
 // Yanıt nesnesinden kullanıcı listesini çıkar — Instagram farklı şekillerde döndürebilir.
 function extractFollowUsers(data) {
@@ -742,7 +759,7 @@ async function igFetchViaContentScript(endpoint, params) {
   });
 }
 
-async function getFollowingInternal(userId) {
+async function getFollowing(userId) {
   if (_followingCache.length > 0 && Date.now() - _followingCacheTs < 4 * 3600000) {
     return _followingCache;
   }
@@ -776,7 +793,7 @@ async function getFollowingInternal(userId) {
     const allUsers = [];
     let maxId = null;
     let pages = 0;
-    const MAX_PAGES = 3;
+    const MAX_PAGES = 8;
     do {
       const params = { count: '50' };
       if (maxId) params.max_id = maxId;
@@ -816,7 +833,7 @@ async function getFollowingInternal(userId) {
     const allUsers = [];
     let maxId = null;
     let pages = 0;
-    const MAX_PAGES = 3;
+    const MAX_PAGES = 8;
     do {
       const params = { count: '50' };
       if (maxId) params.max_id = maxId;
@@ -853,16 +870,6 @@ async function getFollowingInternal(userId) {
   }
 
   return _followingCache;
-}
-
-async function getFollowing(userId) {
-  if (followingInFlight) return followingInFlight;
-  followingInFlight = getFollowingInternal(userId);
-  try {
-    return await followingInFlight;
-  } finally {
-    followingInFlight = null;
-  }
 }
 
 // ── Instagram sekmesi bulma / açma ───────────────────────────────────
@@ -1048,14 +1055,15 @@ async function execRestInTab(tabId, url, method, bodyObj) {
   return res.data;
 }
 
-// ── Ana API çağrısı (tek çağrı; otomatik retry yok) ─────────────────────
+// ── Ana API çağrısı (sekme hatalarında yeniden dener) ─────────────────
 async function apiCall(endpoint, params, method = 'GET', body) {
-  if (!/^\/api\/[A-Za-z0-9_/?=&.%:+-]+$/.test(String(endpoint ?? ''))) {
-    throw new Error('Geçersiz Instagram API yolu');
-  }
-  if (!['GET', 'POST'].includes(method)) {
-    throw new Error('Desteklenmeyen API yöntemi');
-  }
+  const isTabError = e =>
+    e instanceof Error &&
+    (e.message.includes('No tab with id') ||
+      e.message.includes('Cannot access') ||
+      e.message.includes('No frame with id') ||
+      isTransientTabIssue(e) ||        // sekme navigasyon/challenge sırasında null result veya HTML kabuk yanıtı
+      (e.message.includes('tab') && e.message.includes('closed')));
 
   // Kullanıcı bilgisi endpoint'i için GraphQL yolunu kullan
   if (endpoint === '/api/v1/accounts/current_user/?edit=true' && method === 'GET') {
@@ -1081,16 +1089,76 @@ async function apiCall(endpoint, params, method = 'GET', body) {
   let url = endpoint.startsWith('http') ? endpoint : `https://www.instagram.com${endpoint}`;
   if (params && Object.keys(params).length > 0) url += '?' + new URLSearchParams(params).toString();
 
-  const key = requestKey(endpoint, params, method, body);
-  return runOncePerKey(
-    `api:${key}`,
-    async () => {
-      const data = await execRestInTab(tabId, url, method, body ?? null);
-      await appendDebugLog('info', 'execRestInTab başarılı', { endpoint, method });
-      return data;
-    },
-    method === 'GET' ? REQUEST_CACHE_TTL_MS : 0,
-  );
+  try {
+    const data = await execRestInTab(tabId, url, method, body ?? null);
+    await appendDebugLog('info', 'execRestInTab başarılı', { endpoint, method });
+    return data;
+  } catch (e) {
+    if (isTabError(e)) {
+      // Instagram ana sayfasına yönlendirme = throttle/anti-bot sinyali.
+      // Sekme değiştirmek yardımcı olmaz; yeniden deneme yapmadan doğrudan fırlat.
+      // Loglama üst katmana (autolikeTick) bırakılır — böylece her tick için
+      // tek bir 'warn' kaydı oluşur, mükerrer girdi olmaz.
+      if (e.message.includes('beklenmeyen HTML sayfası')) {
+        // Instagram geçici throttle/redirect — 8-12 sn bekle, aynı sekmede bir kez daha dene.
+        // Önceki sürümde burası anında throw ediyordu; throttle penceresi kısa olduğundan
+        // kısa bir bekleme sonrası çoğu durumda başarılı olur.
+        await new Promise(r => setTimeout(r, 8000 + Math.random() * 4000));
+        try {
+          const data = await execRestInTab(tabId, url, method, body ?? null);
+          await appendDebugLog('info', 'execRestInTab başarılı (html-throttle-retry)', { endpoint, method });
+          return data;
+        } catch (retryErr) {
+          if (!isTransientTabIssue(retryErr)) {
+            await appendDebugLog('warn', retryErr.message || retryErr, { endpoint, method, retry: 'html-throttle' });
+          }
+          throw retryErr;
+        }
+      }
+      // "No tab with id": sekme kapatılmış — aynı ölü ID ile yeniden denemenin
+      // hiçbir anlamı yok, direkt geçerli bir sekme al ve tek adımda retry yap.
+      if (e.message.includes('No tab with id')) {
+        try {
+          tabId = await getInstagramTab();
+          const data = await execRestInTab(tabId, url, method, body ?? null);
+          await appendDebugLog('info', 'execRestInTab başarılı (no-tab-retry)', { endpoint, method });
+          return data;
+        } catch (noTabRetryErr) {
+          if (!isTransientTabIssue(noTabRetryErr)) {
+            await appendDebugLog('error', noTabRetryErr.message || noTabRetryErr, { endpoint, method, retry: 'no-tab' });
+          }
+          throw noTabRetryErr;
+        }
+      }
+
+      // Yanıt boş: sekme yönlenme/challenge sırasında null döndü.
+      // Önce AYNI sekmede dene (kısa navigasyonlar genellikle 1-2 sn içinde çözülür).
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        const data = await execRestInTab(tabId, url, method, body ?? null);
+        await appendDebugLog('info', 'execRestInTab başarılı (retry-same)', { endpoint, method });
+        return data;
+      } catch (sameTabError) {
+        // Aynı sekme hâlâ sorunlu — yeni bir sekme dene.
+        try {
+          tabId = await getInstagramTab();
+          const data = await execRestInTab(tabId, url, method, body ?? null);
+          await appendDebugLog('info', 'execRestInTab başarılı (retry-newtab)', { endpoint, method });
+          return data;
+        } catch (newTabError) {
+          // Tüm denemeler başarısız; yalnızca gerçek hataları logla.
+          // Geçici HTML yönlendirmesi üst katman tarafından tek seferlik loglanır.
+          const isStillEmpty = isTransientTabIssue(newTabError);
+          if (!isStillEmpty) {
+            await appendDebugLog('error', newTabError.message || newTabError, { endpoint, method, retry: true });
+          }
+          throw newTabError;
+        }
+      }
+    }
+    await appendDebugLog('error', e.message || e, { endpoint, method });
+    throw e;
+  }
 }
 
 // ── GraphQL ile kullanıcı verisi çekme ───────────────────────────────
@@ -1366,7 +1434,7 @@ function broadcastStatus() {
 }
 
 // ── Ana otomasyon tiki ────────────────────────────────────────────────
-async function autolikeTickInternal() {
+async function autolikeTick() {
   const state = await getState();
   if (!state.enabled) return;
 
@@ -1795,6 +1863,28 @@ async function autolikeTickInternal() {
     // loglamanın anlamı yok — kullanıcı tarayıcıdan yeniden giriş yapana kadar
     // otomasyonu tamamen duraklat (sessionid çerezi kontrolüyle aynı davranış).
     let isSessionExpired = msg.includes('Oturum süresi dolmuş');
+    // Hatalı pozitif önlemi: "oturum süresi dolmuş" hatası tetiklenmeden önce
+    // sessionid çerezinin gerçekten kaybolup kaybolmadığını doğrula. CDN/altyapı
+    // yönlendirmeleri geçici HTML yanıtı döndürdüğünde çerez hâlâ geçerliyken
+    // otomasyon yanlışlıkla devre dışı bırakılabilir; çerez mevcut olduğu sürece
+    // bu tür hatayı geçici hata olarak ele al ve otomasyonu kapatma.
+    if (isSessionExpired) {
+      try {
+        const sessionCookie = await new Promise(r =>
+          chrome.cookies.get({ url: 'https://www.instagram.com', name: 'sessionid' }, r)
+        );
+        if (sessionCookie?.value) {
+          // Çerez hâlâ mevcut — gerçek oturum kaybı değil, geçici HTTP yanıtı.
+          // Kısa bir backoff ile devam et; otomasyonu kapatma.
+          isSessionExpired = false;
+          await appendDebugLog('warn', 'Geçici "oturum süresi dolmuş" yanıtı — sessionid çerezi mevcut, otomasyon kapatılmıyor', {
+            phase: 'autolikeTick', originalMessage: msg,
+          });
+        }
+      } catch {
+        // Çerez kontrolü başarısız → güvende ol, orijinal davranışı koru
+      }
+    }
     // Instagram ana sayfasına yönlendirme = throttle/anti-bot sinyali.
     // Rate-limit gibi davran: 30 dk bekle, otomasyonu kapatma.
     // apiCall bu hatayı artık loglamıyor — burada tek seferlik kaydedilir.
@@ -1856,16 +1946,6 @@ async function autolikeTickInternal() {
       backoffMinutes,
     });
     broadcastStatus();
-  }
-}
-
-async function autolikeTick() {
-  if (autolikeInFlight) return autolikeInFlight;
-  autolikeInFlight = autolikeTickInternal();
-  try {
-    return await autolikeInFlight;
-  } finally {
-    autolikeInFlight = null;
   }
 }
 
@@ -1939,16 +2019,6 @@ async function fetchFollowListViaContentScript(endpoint, params, method, body, c
 
 // ── Mesaj dinleyicileri ───────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
-  const senderUrl = String(_sender?.url ?? _sender?.tab?.url ?? '');
-  const isExtensionSender = senderUrl.startsWith(chrome.runtime.getURL(''));
-  const isInstagramSender = /^https:\/\/(?:www\.)?instagram\.com\//i.test(senderUrl);
-  const panelMessages = new Set(['REFRESH_USER_DATA', 'IG_GQL_MUTATION', 'DOM_LIKE_STORY', 'IG_AUTO_GET', 'IG_SESSION_PROBE', 'IG_AUTO_SET', 'IG_AUTO_CLEAR_CACHE', 'IG_API', 'IG_LOGOUT']);
-  const pageMessages = new Set(['IG_USER_DATA', 'IG_FOLLOW_LIST']);
-  if ((panelMessages.has(msg?.type) && !isExtensionSender) || (pageMessages.has(msg?.type) && !isInstagramSender)) {
-    reply({ ok: false, error: 'Yetkisiz mesaj kaynağı' });
-    return false;
-  }
-
   if (msg.type === 'IG_USER_DATA') {
     chrome.storage.local.set({ igUser: msg.user, igUserTs: Date.now() });
     const panelUrl = chrome.runtime.getURL('panel.html');
@@ -1979,10 +2049,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   }
 
   if (msg.type === 'IG_GQL_MUTATION') {
-    if (!msg.docId || typeof msg.variables !== 'object' || typeof msg.friendlyName !== 'string') {
-      reply({ ok: false, error: 'Geçersiz GraphQL isteği' });
-      return false;
-    }
     runGraphQLMutation(msg.docId, msg.variables, msg.friendlyName)
       .then(data => reply({ ok: true, data }))
       .catch(e => {
@@ -1995,10 +2061,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   }
 
   if (msg.type === 'DOM_LIKE_STORY') {
-    if (typeof msg.like !== 'boolean') {
-      reply({ ok: false, error: 'Geçersiz hikaye işlemi' });
-      return false;
-    }
     chrome.tabs.query({ url: '*://*.instagram.com/*' }, tabs => {
       const igTabs = tabs.filter(t => t.id != null);
       if (igTabs.length === 0) { reply({ ok: false, error: 'Açık Instagram sekmesi bulunamadı' }); return; }
@@ -2161,9 +2223,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg.type === 'IG_AUTO_SET') {
     const allowed = ['enabled', 'timeFrom', 'timeTo', 'minDelaySec', 'maxDelaySec', 'maxPerDay', 'maxPerHour', 'targetType', 'batchSize', 'batchPauseSec', 'enabledContentTypes'];
     const patch = {};
-    const incoming = msg.patch && typeof msg.patch === 'object' ? msg.patch : {};
     for (const key of allowed) {
-      if (key in incoming) patch[key] = incoming[key];
+      if (key in msg.patch) patch[key] = msg.patch[key];
     }
     if (patch.enabled === true) { patch.nextRunAt = 0; patch.backoffUntil = 0; }
     patchState(patch).then(() => {
@@ -2220,11 +2281,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
   if (msg.type === 'IG_API') {
     const endpoint = String(msg.endpoint ?? '');
-    const method = String(msg.method ?? 'GET').toUpperCase();
-    if (!/^\/api\//.test(endpoint) || !['GET', 'POST'].includes(method)) {
-      reply({ ok: false, error: 'Yalnızca Instagram /api/ uç noktaları desteklenir' });
-      return false;
-    }
     const isFollowList = endpoint.includes('/friendships/') &&
       (endpoint.includes('/followers') || endpoint.includes('/following'));
 
@@ -2246,7 +2302,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
         //     SPA navigasyonu yeni bir ağ isteği tetiklemiyor, bu nedenle
         //     page-data-bridge hiçbir zaman yanıt yakalayamıyor.)
         try {
-          const data = await apiCall(endpoint, msg.params, method, msg.body);
+          const data = await apiCall(endpoint, msg.params, msg.method ?? 'GET', msg.body);
           const users = Array.isArray(data.users) ? data.users : [];
           if (users.length > 0) {
             chrome.storage.local.set({
@@ -2270,7 +2326,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     }
 
     // Takipçi/takip listesi dışındaki IG_API çağrıları
-    apiCall(endpoint, msg.params, method, msg.body)
+    apiCall(endpoint || msg.endpoint, msg.params, msg.method ?? 'GET', msg.body)
       .then(data => reply({ ok: true, data }))
       .catch(e => {
         let errorMsg = e.message ?? String(e);
@@ -2298,15 +2354,223 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
 // ── Gerçek çıkış işlemi ───────────────────────────────────────────────
 async function performLogout() {
-  // Güvenli çıkış: yalnızca uzantının kendi kopyalarını temizle.
-  // Instagram oturum çerezlerine ve açık sekmelerin URL'lerine dokunma.
+  // Instagram oturum çerezlerini sil
+  const instagramUrl = 'https://www.instagram.com';
+  const cookieNames = ['sessionid', 'csrftoken', 'ds_user_id', 'mid', 'ig_did', 'rur', 'urlgen'];
+  for (const name of cookieNames) {
+    try {
+      await chrome.cookies.remove({ url: instagramUrl, name });
+    } catch {}
+  }
+  // Tüm .instagram.com domain çerezlerini de silmeye çalış
+  const allCookies = await chrome.cookies.getAll({ domain: 'instagram.com' });
+  for (const cookie of allCookies) {
+    try {
+      await chrome.cookies.remove({ url: `https://${cookie.domain}${cookie.path}`, name: cookie.name });
+    } catch {}
+  }
+
+  // Uzantı storage'daki oturum verilerini temizle
   await chrome.storage.local.remove(['igUser', 'igUserTs', 'igGqlTokens', '__analytics_log', '__automation_debug_log']);
   await patchState({
     enabled: false,
     todayCount: 0,
     lastActionLabel: 'Oturum kapatıldı',
   });
+
+  // Açık Instagram sekmelerini çıkış sayfasına yönlendir
+  chrome.tabs.query({ url: '*://*.instagram.com/*' }, tabs => {
+    for (const tab of tabs) {
+      if (tab.id != null) {
+        chrome.tabs.update(tab.id, { url: 'https://www.instagram.com/accounts/logout/' }).catch(() => {});
+      }
+    }
+  });
 }
+
+// ── Oturum probe'u — gerçekten geçerli mi, yoksa sadece çerez var mı? ─
+// Çerez mevcut olsa bile Instagram sunucu tarafı expire/revoke etmiş
+// olabilir (başka cihazdan çıkış, şifre değişikliği, şüpheli giriş reset'i).
+// Bu fonksiyon /api/v1/accounts/current_user/ uç noktasına gidip JSON user
+// mı yoksa HTML login sayfası mı geldiğini kontrol eder.
+async function probeSession() {
+  const result = {
+    valid: false,
+    reason: '',
+    httpStatus: 0,
+    username: '',
+    userId: '',
+    csrftoken: '',
+    sessionidPresent: false,
+    checkedAt: Date.now(),
+  };
+  // 1) Önce çerez mevcut mu?
+  const cookie = await new Promise(resolve =>
+    chrome.cookies.get({ url: 'https://www.instagram.com', name: 'sessionid' }, resolve)
+  );
+  // Tüm olası eşleşmeleri tara; bazı Chrome sürümleri domain'i farklı
+  // kaydedebiliyor (.instagram.com vs instagram.com).
+  let allIgs = [];
+  try {
+    allIgs = await chrome.cookies.getAll({ domain: 'instagram.com' });
+  } catch {}
+  const sessionidCookie = cookie?.value
+    ? cookie
+    : (allIgs.find(c => c.name === 'sessionid' && c.value) ?? null);
+  result.sessionidPresent = !!sessionidCookie?.value;
+  if (!result.sessionidPresent) {
+    result.reason = 'sessionid çerezi yok — instagram.com\'a giriş yap';
+    return result;
+  }
+
+  // 2) Çerez var → gerçek bir istekle doğrula
+  let resp;
+  try {
+    resp = await fetch('https://www.instagram.com/api/v1/accounts/current_user/?edit=true', {
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'manual',
+      headers: {
+        'x-ig-app-id': '936619743392459',
+        'x-requested-with': 'XMLHttpRequest',
+        'accept': 'application/json',
+      },
+    });
+  } catch (e) {
+    result.reason = 'ağ hatası: ' + (e.message || String(e)).slice(0, 80);
+    return result;
+  }
+  result.httpStatus = resp.status;
+  const text = await resp.text();
+  const lower = text.toLowerCase();
+
+  // 3) Gerçek login yönlendirmesi → oturum ölmüş
+  // NOT: text.startsWith('<') tek başına yeterli değil — Instagram anti-bot olarak
+  // JSON endpoint'e HTML dönebiliyor ama bu gerçek oturum kaybı değil.
+  // Sadece body'de login/logout spesifik kelimeler varsa ya da 401/403 gelirse geçersiz say.
+  const isRealLoginPage = lower.includes('/accounts/login') || lower.includes('login_required');
+  if (isRealLoginPage || resp.status === 401 || resp.status === 403) {
+    if (resp.status === 429) result.reason = 'Instagram rate-limit (429)';
+    else if (resp.status === 401 || resp.status === 403) result.reason = `HTTP ${resp.status} — oturum reddedildi`;
+    else result.reason = 'geçersiz oturum — Instagram login sayfası döndü';
+    return result;
+  }
+  // HTML ama login sayfası değil → anti-bot geçici yanıt, sessionid çerezi mevcut
+  // olduğu için oturumu geçerli sayıyoruz (gerçek doğrulama çereze dayanıyor).
+  if (!text || text.trimStart().startsWith('<')) {
+    result.valid = true;
+    result.reason = 'sessionid çerezi mevcut (API geçici HTML döndürdü — anti-bot)';
+    return result;
+  }
+
+  // 4) JSON parse → user içeriyor mu?
+  try {
+    const json = JSON.parse(text);
+    const u = json?.user ?? json?.data?.user;
+    if (json?.status === 'fail' || json?.require_login || json?.message === 'login_required') {
+      result.reason = 'API login_required döndü';
+      return result;
+    }
+    if (u && (u.username || u.pk || u.id)) {
+      result.valid = true;
+      result.username = u.username ?? '';
+      result.userId = String(u.pk ?? u.id ?? '');
+      result.reason = 'oturum geçerli';
+      return result;
+    }
+    // Bazen response içinde doğrudan kullanıcı adı olmaz, items dizisinde olur
+    const items = json?.items ?? [];
+    if (Array.isArray(items) && items[0]?.user?.username) {
+      result.valid = true;
+      result.username = items[0].user.username;
+      result.userId = String(items[0].user.pk ?? items[0].user.id ?? '');
+      result.reason = 'oturum geçerli (kullanıcı listesi)';
+      return result;
+    }
+    result.reason = 'tanımsız JSON — beklenen user alanı yok';
+    return result;
+  } catch {
+    result.reason = 'JSON parse hatası — yanıt beklenmedik formatta';
+    return result;
+  }
+}
+
+// ── Alarm kurulumu ────────────────────────────────────────────────────
+function setupAlarms() {
+  chrome.alarms.get(ALARM_KEEPALIVE, a => { if (!a) chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 5 }); });
+  chrome.alarms.get(ALARM_AUTOLIKE,  a => { if (!a) chrome.alarms.create(ALARM_AUTOLIKE,  { periodInMinutes: 1 }); });
+}
+
+setupAlarms();
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 5 });
+  chrome.alarms.create(ALARM_AUTOLIKE,  { periodInMinutes: 1 });
+});
+
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === ALARM_KEEPALIVE) {
+    // Sessiz tutuldu — sadece çerez varlığını kaydet, FETCH atma.
+    // background service worker'dan instagram.com'a periyodik fetch
+    // atılması Instagram'ın rate-limit / reCAPTCHA tetikleme
+    // eşiğini hızla dolduruyor. Sunucu canlı doğrulaması yalnızca
+    // kullanıcı kart üzerinden "Şimdi kontrol et" e bastığında
+    // ve AÇIK bir instagram.com sekmesinin içinden yapılıyor.
+    chrome.cookies.get({ url: 'https://www.instagram.com', name: 'sessionid' }, cookie => {
+      const present = !!cookie?.value;
+      patchState({
+        sessionCheckedAt: Date.now(),
+        sessionValid: present,
+        sessionReason: present
+          ? 'Çerez mevcut (sunucu doğrulaması için "Şimdi kontrol et" kullanın)'
+          : 'sessionid çerezi yok — instagram.com\'a giriş yapın',
+      }).catch(() => {});
+      if (!present) {
+        // Çerez kayıp → otomasyonu güvenli şekilde duraklat
+        patchState({
+          backoffUntil: Date.now() + 30 * 60000,
+          enabled: false,
+          lastActionLabel: 'sessionid çerezi yok — instagram.com\'a tarayıcıdan giriş yapıp otomasyonu tekrar aç',
+        }).catch(() => {});
+        broadcastStatus();
+      } else {
+        broadcastStatus();
+      }
+    });
+  }
+  if (alarm.name === ALARM_AUTOLIKE) {
+    chrome.cookies.get({ url: 'https://www.instagram.com', name: 'sessionid' }, cookie => {
+      if (cookie?.value) {
+        autolikeTick().catch(() => {});
+        return;
+      }
+      // Cookie reads can briefly return empty during navigation. A cached
+      // user still represents the active extension session.
+      chrome.storage.local.get(['igUser'], data => {
+        if (data?.igUser) autolikeTick().catch(() => {});
+      });
+    });
+  }
+});
+
+// ── Cookie değişikliği — giriş yapılınca panel aç ─────────────────────
+chrome.cookies.onChanged.addListener(change => {
+  const { cookie, removed } = change;
+  if (cookie.name !== 'sessionid') return;
+  if (cookie.domain !== 'instagram.com' && cookie.domain !== '.instagram.com') return;
+  if (removed) return;
+
+  const panelUrl = chrome.runtime.getURL('panel.html');
+  chrome.tabs.query({}, tabs => {
+    // startsWith: React Router panel.html#/... formatındaki mevcut sekmeyi de yakalar
+    const existing = tabs.find(t => t.url && t.url.startsWith(panelUrl));
+    if (existing?.id != null) {
+      focusTabSafely(existing);   // zaten açık → sadece öne getir, yeni sekme açma
+    } else {
+      Promise.resolve(chrome.tabs.create({ url: panelUrl })).catch(() => {});
+    }
+  });
+});
 
 // ── Uzantı simgesine tıklama ──────────────────────────────────────────
 chrome.action.onClicked.addListener(() => {
@@ -2362,6 +2626,9 @@ chrome.action.onClicked.addListener(() => {
       }
     } catch {}
   }
+
+  chrome.alarms.onAlarm.addListener(() => { setTimeout(poll, 3500); });
+  setTimeout(poll, 5000);
 
   chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (msg.type !== 'ANALYTICS_GET_STATE') return false;

@@ -16,6 +16,9 @@
         if (existing && existing.id != null) {
           // Zaten açık → sadece öne getir
           chrome.tabs.update(existing.id, { active: true });
+          if (existing.windowId != null) {
+            chrome.windows.update(existing.windowId, { focused: true });
+          }
           if (typeof callback === 'function') callback(existing);
           window.close(); // popup'ı kapat
         } else {

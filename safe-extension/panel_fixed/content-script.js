@@ -9,12 +9,6 @@
 const INSTAGRAM_GRAPHQL_DOC_ID = '26785645987802781';
 const INSTAGRAM_APP_ID = '936619743392459';
 let downloadedResponseUser = null;
-let userPublishInFlight = null;
-let lastUserPublishAt = 0;
-const USER_REFRESH_COOLDOWN_MS = 60_000;
-const requestInFlight = new Map();
-const responseCache = new Map();
-const RESPONSE_CACHE_TTL_MS = 15_000;
 
 function csrfToken() {
   return document.cookie
@@ -211,11 +205,7 @@ function getPageTokens() {
 }
 
 async function requestJson(endpoint, params, method = 'GET', body) {
-  const urlObject = new URL(endpoint, window.location.origin);
-  if (urlObject.origin !== window.location.origin || !urlObject.pathname.startsWith('/api/')) {
-    throw new Error('Güvenlik nedeniyle yalnızca Instagram API yollarına izin verilir');
-  }
-  let url = urlObject.toString();
+  let url = endpoint.startsWith('http') ? endpoint : `https://www.instagram.com${endpoint}`;
   if (params && Object.keys(params).length) url += `?${new URLSearchParams(params).toString()}`;
   const headers = {
     'X-CSRFToken': csrfToken(),
@@ -225,32 +215,15 @@ async function requestJson(endpoint, params, method = 'GET', body) {
     Referer: 'https://www.instagram.com/',
   };
   if (body) headers['Content-Type'] = 'application/x-www-form-urlencoded';
-  const bodyText = body ? new URLSearchParams(body).toString() : '';
-  const key = `${method}:${url}:${bodyText}`;
-  const now = Date.now();
-  const cached = responseCache.get(key);
-  if (method === 'GET' && cached && cached.expiresAt > now) return cached.data;
-  if (requestInFlight.has(key)) return requestInFlight.get(key);
-
-  const request = (async () => {
-    const response = await fetch(url, {
-      method,
-      credentials: 'include',
-      headers,
-      body: bodyText || undefined,
-    });
-    const text = await response.text();
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
-    const data = JSON.parse(text.replace(/^for\s*\(;;\);\s*/, ''));
-    if (method === 'GET') responseCache.set(key, { data, expiresAt: Date.now() + RESPONSE_CACHE_TTL_MS });
-    return data;
-  })();
-  requestInFlight.set(key, request);
-  try {
-    return await request;
-  } finally {
-    requestInFlight.delete(key);
-  }
+  const response = await fetch(url, {
+    method,
+    credentials: 'include',
+    headers,
+    body: body ? new URLSearchParams(body).toString() : undefined,
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+  return JSON.parse(text.replace(/^for\s*\(;;\);\s*/, ''));
 }
 
 async function requestProfileGraphQL() {
@@ -342,21 +315,39 @@ async function fetchFullUser() {
 }
 
 async function publishUser() {
-  const now = Date.now();
-  if (userPublishInFlight) return userPublishInFlight;
-  if (now - lastUserPublishAt < USER_REFRESH_COOLDOWN_MS) return null;
-  lastUserPublishAt = now;
-  userPublishInFlight = (async () => {
   const user = await fetchFullUser();
   if (user?.pk) chrome.runtime.sendMessage({ type: 'IG_USER_DATA', user });
-  })().finally(() => {
-    userPublishInFlight = null;
-  });
-  return userPublishInFlight;
 }
 
-// Tek başlangıç keşfi: sayfa açık kaldığı sürece periyodik istek atılmaz.
-setTimeout(() => publishUser().catch(() => {}), 1000);
+document.addEventListener('takipci-panel:instagram-response', (event) => {
+  consumeDownloadedResponse(event.detail);
+});
+
+// Instagram'ın kendi sayfa fetch'inden yakalanan takipçi/takip listesi
+document.addEventListener('takipci-panel:follow-list', (event) => {
+  try {
+    chrome.runtime.sendMessage({ type: 'IG_FOLLOW_LIST', payload: event.detail });
+  } catch {}
+});
+
+// page-data-bridge runs at document_start while this script runs at
+// document_idle. If Instagram answered before this listener existed, consume
+// the DOM handoff written by the bridge.
+try {
+  const retainedFollowList = document.documentElement?.getAttribute(
+    'data-takipci-panel-follow-list',
+  );
+  if (retainedFollowList) {
+    chrome.runtime.sendMessage({
+      type: 'IG_FOLLOW_LIST',
+      payload: retainedFollowList,
+    });
+  }
+} catch {}
+
+setTimeout(() => publishUser().catch(() => {}), 800);
+setTimeout(() => publishUser().catch(() => {}), 5000);
+setInterval(() => publishUser().catch(() => {}), 120000);
 
 function clickLike(like) {
   const labels = like

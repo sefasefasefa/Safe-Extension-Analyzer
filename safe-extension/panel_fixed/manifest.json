@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Takipçi Paneli",
-  "version": "1.1.0-safe",
-  "description": "Takipçi Paneli — Instagram işlemlerini dar izinler, tekilleştirme ve güvenli hız sınırlarıyla yönetir.",
+  "version": "1.0.15",
+  "description": "Takipçi Paneli — Instagram takip & otomasyon paneli · Powered by Rodon (rodon.studio). Chrome, Edge ve Firefox ile uyumlu.",
   "icons": {
     "16": "icon16.png",
     "48": "icon48.png",
@@ -27,19 +27,45 @@
         "*://*.instagram.com/*"
       ],
       "js": [
+        "page-data-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.instagram.com/*"
+      ],
+      "js": [
         "content-script.js"
       ],
       "run_at": "document_idle"
     }
   ],
   "permissions": [
+    "cookies",
     "storage",
     "tabs",
-    "scripting"
+    "windows",
+    "scripting",
+    "alarms",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
-    "*://*.instagram.com/*"
+    "*://*.instagram.com/*",
+    "*://*.fbcdn.net/*",
+    "*://*.cdninstagram.com/*",
+    "<all_urls>"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "cdn_corp_bypass",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
   "browser_specific_settings": {
     "gecko": {
       "id": "takipci-paneli@extension",

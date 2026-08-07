@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "Cross-Origin-Resource-Policy", "operation": "remove" },
+        { "header": "Cross-Origin-Embedder-Policy",  "operation": "remove" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "*.fbcdn.net/*",
+      "resourceTypes": ["image", "xmlhttprequest", "other"]
+    }
+  },
+  {
+    "id": 2,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "responseHeaders": [
+        { "header": "Cross-Origin-Resource-Policy", "operation": "remove" },
+        { "header": "Cross-Origin-Embedder-Policy",  "operation": "remove" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "*.cdninstagram.com/*",
+      "resourceTypes": ["image", "xmlhttprequest", "other"]
+    }
+  }
+]

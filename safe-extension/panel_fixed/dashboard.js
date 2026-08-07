@@ -404,6 +404,14 @@ if (chrome && chrome.runtime && chrome.runtime.onMessage) {
   });
 }
 
+// ── Dashboard açıkken düzenli aralıklarla yenile (yedek: 2 sn) ──────────
+setInterval(() => {
+  const overlay = document.getElementById('dash-overlay');
+  if (overlay && overlay.classList.contains('open')) {
+    dovLoadData();
+  }
+}, 2000);
+
 // ── Olay dinleyicileri (MV3 CSP: inline onclick yasak) ───────────────
 document.addEventListener('DOMContentLoaded', function () {
   const fab = document.getElementById('dash-fab');
