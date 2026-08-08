@@ -48,10 +48,22 @@
     "tabs",
     "windows",
     "scripting",
-    "alarms"
+    "alarms",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
-    "*://*.instagram.com/*"
+    "*://*.instagram.com/*",
+    "*://*.fbcdn.net/*",
+    "*://*.cdninstagram.com/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "cdn_corp_bypass",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
   ],
   "browser_specific_settings": {
     "gecko": {
