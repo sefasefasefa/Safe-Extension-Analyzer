@@ -1,1 +1,2 @@
 - [Extension navigation safety](extension-navigation-safety.md) — local cleanup must never delete Instagram cookies or navigate existing tabs; new tabs require explicit user action.
+- [Instagram request safety](instagram-request-safety.md) — keep rate-limit/session stops shared across extension worlds and fail closed after server enforcement.

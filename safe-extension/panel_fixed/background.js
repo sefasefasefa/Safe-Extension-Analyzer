@@ -2152,6 +2152,7 @@ async function fetchFollowListViaContentScript(endpoint, params, method, body, c
   const kind = endpoint.includes('/followers') ? 'followers' : 'following';
   const targetUrl = 'https://www.instagram.com/' + user.username + '/' + kind + '/';
 
+  // Kullanıcının açık bir Instagram sekmesi yoksa yeni sekme açma.
   if (!tab?.id) {
     return 'Açık Instagram sekmesi bulunamadı — instagram.com adresini manuel açıp tekrar deneyin';
   }
@@ -2266,7 +2267,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
             t.id != null &&
             t.status === 'complete' &&
             !t.url?.includes('/accounts/')
-          );
+          ) ?? tabs.find(t => t.id != null && t.status === 'complete');
           if (!tab?.id) {
             reject(new Error('Açık Instagram sekmesi bulunamadı'));
             return;
@@ -2611,7 +2612,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
         } else if (errorMsg.includes('No tab with id')) {
           errorMsg = 'Açık bir Instagram sekmesi bulunamadı. instagram.com\'u açık tutun ve tekrar deneyin.';
         } else if (errorMsg.includes('Oturum süresi dolmuş')) {
-          errorMsg = 'Instagram oturumu doğrulanamadı. Açık Instagram sekmesini kontrol edin.';
+          errorMsg = 'Instagram oturumu sona ermiş. instagram.com\'a yeniden giriş yapın.';
         }
         reply({ ok: false, error: errorMsg });
       });
@@ -2621,7 +2622,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg.type === 'CLEAR_EXTENSION_DATA') {
     clearExtensionData()
       .then(() => reply({ ok: true }))
-      .catch(e => reply({ ok: false, error: e.message }));
+      .catch(e => reply({ ok: false, error: e.message || String(e) }));
     return true;
   }
 
@@ -2630,8 +2631,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
 // ── Uzantı verilerini temizleme ───────────────────────────────────────
 async function clearExtensionData() {
-  // Yalnızca uzantının kendi önbelleğini temizle. Kullanıcının Instagram
-  // çerezlerine, açık sekmelerine veya tarayıcı navigasyonuna dokunma.
+  // Instagram çerezlerine ve açık sekmelere dokunma; yalnızca uzantı verisini temizle.
   await chrome.storage.local.remove([
     'igUser',
     'igUserTs',
@@ -2649,6 +2649,113 @@ async function clearExtensionData() {
     todayCount: 0,
     lastActionLabel: 'Uzantı verileri temizlendi',
   });
+}
+
+// ── Oturum probe'u — gerçekten geçerli mi, yoksa sadece çerez var mı? ─
+// Çerez mevcut olsa bile Instagram sunucu tarafı expire/revoke etmiş
+// olabilir (başka cihazdan çıkış, şifre değişikliği, şüpheli giriş reset'i).
+// Bu fonksiyon /api/v1/accounts/current_user/ uç noktasına gidip JSON user
+// mı yoksa HTML login sayfası mı geldiğini kontrol eder.
+async function probeSession() {
+  const result = {
+    valid: false,
+    reason: '',
+    httpStatus: 0,
+    username: '',
+    userId: '',
+    csrftoken: '',
+    sessionidPresent: false,
+    checkedAt: Date.now(),
+  };
+  // 1) Önce çerez mevcut mu?
+  const cookie = await new Promise(resolve =>
+    chrome.cookies.get({ url: 'https://www.instagram.com', name: 'sessionid' }, resolve)
+  );
+  // Tüm olası eşleşmeleri tara; bazı Chrome sürümleri domain'i farklı
+  // kaydedebiliyor (.instagram.com vs instagram.com).
+  let allIgs = [];
+  try {
+    allIgs = await chrome.cookies.getAll({ domain: 'instagram.com' });
+  } catch {}
+  const sessionidCookie = cookie?.value
+    ? cookie
+    : (allIgs.find(c => c.name === 'sessionid' && c.value) ?? null);
+  result.sessionidPresent = !!sessionidCookie?.value;
+  if (!result.sessionidPresent) {
+    result.reason = 'sessionid çerezi yok — instagram.com\'a giriş yap';
+    return result;
+  }
+
+  // 2) Çerez var → gerçek bir istekle doğrula
+  let resp;
+  try {
+    resp = await fetch('https://www.instagram.com/api/v1/accounts/current_user/?edit=true', {
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'manual',
+      headers: {
+        'x-ig-app-id': '936619743392459',
+        'x-requested-with': 'XMLHttpRequest',
+        'accept': 'application/json',
+      },
+    });
+  } catch (e) {
+    result.reason = 'ağ hatası: ' + (e.message || String(e)).slice(0, 80);
+    return result;
+  }
+  result.httpStatus = resp.status;
+  const text = await resp.text();
+  const lower = text.toLowerCase();
+
+  // 3) Gerçek login yönlendirmesi → oturum ölmüş
+  // NOT: text.startsWith('<') tek başına yeterli değil — Instagram anti-bot olarak
+  // JSON endpoint'e HTML dönebiliyor ama bu gerçek oturum kaybı değil.
+  // Sadece body'de login/logout spesifik kelimeler varsa ya da 401/403 gelirse geçersiz say.
+  const isRealLoginPage = lower.includes('/accounts/login') || lower.includes('login_required');
+  if (isRealLoginPage || resp.status === 401 || resp.status === 403 || resp.status === 429) {
+    if (resp.status === 429) result.reason = 'Instagram rate-limit (429)';
+    else if (resp.status === 401 || resp.status === 403) result.reason = `HTTP ${resp.status} — oturum reddedildi`;
+    else result.reason = 'geçersiz oturum — Instagram login sayfası döndü';
+    return result;
+  }
+  // HTML ama login sayfası değil → anti-bot geçici yanıt, sessionid çerezi mevcut
+  // olduğu için oturumu geçerli sayıyoruz (gerçek doğrulama çereze dayanıyor).
+  if (!text || text.trimStart().startsWith('<')) {
+    result.valid = true;
+    result.reason = 'sessionid çerezi mevcut (API geçici HTML döndürdü — anti-bot)';
+    return result;
+  }
+
+  // 4) JSON parse → user içeriyor mu?
+  try {
+    const json = JSON.parse(text);
+    const u = json?.user ?? json?.data?.user;
+    if (json?.status === 'fail' || json?.require_login || json?.message === 'login_required') {
+      result.reason = 'API login_required döndü';
+      return result;
+    }
+    if (u && (u.username || u.pk || u.id)) {
+      result.valid = true;
+      result.username = u.username ?? '';
+      result.userId = String(u.pk ?? u.id ?? '');
+      result.reason = 'oturum geçerli';
+      return result;
+    }
+    // Bazen response içinde doğrudan kullanıcı adı olmaz, items dizisinde olur
+    const items = json?.items ?? [];
+    if (Array.isArray(items) && items[0]?.user?.username) {
+      result.valid = true;
+      result.username = items[0].user.username;
+      result.userId = String(items[0].user.pk ?? items[0].user.id ?? '');
+      result.reason = 'oturum geçerli (kullanıcı listesi)';
+      return result;
+    }
+    result.reason = 'tanımsız JSON — beklenen user alanı yok';
+    return result;
+  } catch {
+    result.reason = 'JSON parse hatası — yanıt beklenmedik formatta';
+    return result;
+  }
 }
 
 // ── Alarm kurulumu ────────────────────────────────────────────────────
@@ -2678,15 +2785,15 @@ chrome.alarms.onAlarm.addListener(alarm => {
         sessionCheckedAt: Date.now(),
         sessionValid: present,
         sessionReason: present
-          ? 'Instagram oturumu bulundu'
-          : 'Instagram oturumu bulunamadı — otomasyon duraklatıldı',
+          ? 'Çerez mevcut (sunucu doğrulaması için "Şimdi kontrol et" kullanın)'
+          : 'sessionid çerezi yok — instagram.com\'a giriş yapın',
       }).catch(() => {});
       if (!present) {
         // Çerez kayıp → otomasyonu güvenli şekilde duraklat
         patchState({
           backoffUntil: Date.now() + 30 * 60000,
           enabled: false,
-          lastActionLabel: 'Instagram oturumu bulunamadı — otomasyon duraklatıldı',
+          lastActionLabel: 'sessionid çerezi yok — instagram.com\'a tarayıcıdan giriş yapıp otomasyonu tekrar aç',
         }).catch(() => {});
         broadcastStatus();
       } else {
@@ -2704,7 +2811,7 @@ chrome.alarms.onAlarm.addListener(alarm => {
       patchState({
         enabled: false,
         backoffUntil: Date.now() + 30 * 60000,
-        lastActionLabel: 'Instagram oturumu bulunamadı — otomasyon duraklatıldı',
+        lastActionLabel: 'sessionid çerezi yok — otomasyon duraklatıldı',
       }).catch(() => {});
     });
   }
